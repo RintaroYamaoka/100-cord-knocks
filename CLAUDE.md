@@ -81,6 +81,11 @@ trunk serve            # :8080 でフロント (API は vercel dev へプロキ�
   `File size limit exceeded` で落ちる。成功時も MSBuild の定型出力が出るのでプロキシで除去している
 - **Wandbox は既定 User-Agent を 403 で弾く**。過負荷時は `OCI runtime error` を返すので、
   コンパイルエラーとして見せずに再試行 → 503 で返す
+- **Wandbox 全体が落ちることがある** (2026-09-07: 全コンパイラで HTTP 500
+  `Failed to get uid: status=exit status: 125`)。Rust 以外の 6 言語が一斉に失敗したら、
+  まず `curl -A x -X POST https://wandbox.org/api/compile.json` で上流に直接投げて切り分ける。
+  プロキシは 5xx を再試行して 503「Wandbox が一時的に停止しています」で返す。
+  復旧すれば再デプロイ不要。詳細: `docs/bootstrap/incidents/2026-09-07-wandbox-outage-shown-as-502.md`
 - Playground / Wandbox は非公式・レート制限あり。問題コンテンツの検証は必ず `verifier`
   (ローカル Docker) で行い、上流に一括負荷をかけない
 - **verifier の検査を弱めない**。通らない問題は検査を消すのではなく問題を作り直す

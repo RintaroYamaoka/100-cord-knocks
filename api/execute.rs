@@ -10,8 +10,9 @@ use http_body_util::BodyExt;
 use hyper::StatusCode;
 use shared::language::{Backend, Language};
 use shared::playground::{
-    normalize_playground, normalize_wandbox, validate, wandbox_request, ExecuteRequest,
-    ExecuteResponse, PlaygroundRequest, PlaygroundResponse, WandboxResponse,
+    normalize_playground, normalize_wandbox, validate, wandbox_http_failure_is_transient,
+    wandbox_request, ExecuteRequest, ExecuteResponse, PlaygroundRequest, PlaygroundResponse,
+    WandboxResponse,
 };
 use vercel_runtime::{run, service_fn, Error, Request, Response};
 
@@ -57,6 +58,10 @@ const BUSY: &str = "実行サービスが混雑しています。少し待って
 const UNREACHABLE: &str = "実行サービスに接続できませんでした。しばらくして再試行してください";
 const TIMED_OUT: &str = "実行がタイムアウトしました。無限ループがないか確認してください";
 const UNPARSEABLE: &str = "実行サービスの応答を解釈できませんでした";
+const UPSTREAM_FAILED: &str = "実行サービスがエラーを返しました";
+/// Wandbox 自体が落ちているとき。Rust は別の実行先 (Playground) なので影響しないことを伝える。
+const WANDBOX_DOWN: &str =
+    "実行サービス (Wandbox) が一時的に停止しています。復旧までお待ちください (Rust は影響ありません)";
 
 pub async fn handler(req: Request) -> Result<Response<String>, Error> {
     if req.method() != hyper::Method::POST {
@@ -106,7 +111,7 @@ async fn run_playground(code: &str) -> Result<Response<String>, Error> {
         return json_error(StatusCode::TOO_MANY_REQUESTS, BUSY);
     }
     if !upstream.status().is_success() {
-        return json_error(StatusCode::BAD_GATEWAY, "実行サービスがエラーを返しました");
+        return json_error(StatusCode::BAD_GATEWAY, UPSTREAM_FAILED);
     }
     match upstream.json::<PlaygroundResponse>().await {
         Ok(raw) => ok(&normalize_playground(&raw)),
@@ -133,7 +138,18 @@ async fn run_wandbox(language: Language, code: &str) -> Result<Response<String>,
             return json_error(StatusCode::TOO_MANY_REQUESTS, BUSY);
         }
         if !upstream.status().is_success() {
-            return json_error(StatusCode::BAD_GATEWAY, "実行サービスがエラーを返しました");
+            // 2026-09-07: Wandbox 全体が 500 ("Failed to get uid") を返し続ける障害があった。
+            // 利用者のコードとは無関係なので、再試行のうえ「停止中」として返す。
+            let status = upstream.status().as_u16();
+            let body = upstream.text().await.unwrap_or_default();
+            if wandbox_http_failure_is_transient(status, &body) {
+                if attempt < WANDBOX_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(700 * (attempt as u64 + 1))).await;
+                    continue;
+                }
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, WANDBOX_DOWN);
+            }
+            return json_error(StatusCode::BAD_GATEWAY, UPSTREAM_FAILED);
         }
         let raw: WandboxResponse = match upstream.json().await {
             Ok(r) => r,

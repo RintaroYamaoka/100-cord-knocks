@@ -5,7 +5,8 @@
 use shared::language::Language;
 use shared::playground::{
     classify, classify_line, harness_ran, has_compile_error, has_separate_compile_phase,
-    normalize_playground, normalize_wandbox, strip_csharp_build_noise, validate, ExecuteRequest,
+    normalize_playground, normalize_wandbox, strip_csharp_build_noise, validate,
+    wandbox_http_failure_is_transient, ExecuteRequest,
     ExecuteResponse, LineKind, Outcome, PlaygroundResponse, WandboxResponse, MAX_CODE_BYTES,
     TEST_FAILED_MARKER, TEST_OK_MARKER,
 };
@@ -502,4 +503,27 @@ fn a_run_killed_by_a_signal_is_not_successful() {
     let r = normalize_wandbox(Language::Cpp, &raw);
     assert!(!r.success, "シグナルで殺された実行を成功扱いしている");
     assert_ne!(classify(&r), Outcome::Passed);
+}
+
+// ---- Wandbox の HTTP レベル障害 (2026-09-07 実測) ----
+
+#[test]
+fn wandbox_500_failed_to_get_uid_is_transient() {
+    // 2026-09-07 に全コンパイラで返り続けた本物の応答。
+    let body = "Error: Failed to get uid: status=exit status: 125, base_dir=/tmp/wandbox/wandbox_20260907_052930_gPiCgf";
+    assert!(wandbox_http_failure_is_transient(500, body));
+}
+
+#[test]
+fn wandbox_5xx_without_known_body_is_still_transient() {
+    assert!(wandbox_http_failure_is_transient(502, ""));
+    assert!(wandbox_http_failure_is_transient(503, "<html>Service Unavailable</html>"));
+}
+
+#[test]
+fn wandbox_4xx_is_not_transient() {
+    // 403 (User-Agent 拒否) や 400 は再試行しても直らない。
+    assert!(!wandbox_http_failure_is_transient(403, "Forbidden"));
+    assert!(!wandbox_http_failure_is_transient(400, "bad request"));
+    assert!(!wandbox_http_failure_is_transient(200, ""));
 }

@@ -233,6 +233,17 @@ pub struct WandboxResponse {
     pub program_error: String,
 }
 
+/// Wandbox が HTTP レベルで失敗したとき、それが「上流の一時障害」かどうか。
+///
+/// 2026-09-07 の障害では、Wandbox が全コンパイラで HTTP 500 と
+/// `Error: Failed to get uid: status=exit status: 125, base_dir=/tmp/wandbox/...`
+/// (サーバー側のコンテナランタイム起動失敗) を返し続けた。これは利用者のコードとも
+/// こちらのリクエストとも無関係なので、5xx は再試行したうえで「停止中」として返す。
+/// 4xx (リクエスト不正・403 など) は再試行しても無駄なので一時障害とはみなさない。
+pub fn wandbox_http_failure_is_transient(status: u16, body: &str) -> bool {
+    (500..600).contains(&status) || body.contains("Failed to get uid")
+}
+
 impl WandboxResponse {
     /// 上流が一時的に落ちている (過負荷) ときの応答か。
     /// これをコンパイルエラーとして見せると、正しいコードが赤く出て学習者が混乱する。
