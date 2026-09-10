@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use shared::language::{Backend, Language};
+use shared::language::Language;
 use shared::problem::Level;
 
 /// 選択中の言語を保存する localStorage キー。進捗キーと同じ名前空間に置く。
@@ -89,12 +89,12 @@ pub fn selector_languages(
     }
 }
 
-/// 実行を委譲する上流サービスの表示名 (コンソールの文言用)。
-pub fn backend_label(language: Language) -> &'static str {
-    match language.backend() {
-        Backend::Playground => "Rust Playground",
-        Backend::Wandbox { .. } => "Wandbox",
-    }
+/// 実行基盤の表示名 (コンソールの文言用)。
+///
+/// 7 言語すべて同じ基盤 (Vercel Sandbox の自前イメージ) で動くので言語に依らない。
+/// 引数を残してあるのは、将来また言語ごとに分かれたときに呼び出し側を変えずに済むため。
+pub fn backend_label(_language: Language) -> &'static str {
+    "Vercel Sandbox"
 }
 
 /// 実行前のコンソール placeholder。言語に依らない文言にする。

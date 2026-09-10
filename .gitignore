@@ -10,6 +10,8 @@
 
 # Vercel
 .vercel
+# vercel env pull が置く開発用 OIDC トークン (12 時間で失効するがコミットしない)
+.env*.local
 
 # project-bootstrap ephemeral markers (commit しない)
 .bootstrap/lane
@@ -24,3 +26,4 @@ docs/bootstrap/sprint/.gate
 # 問題生成の中間成果物 (統合後は <難易度>.json が正本)
 # trunk が data/ を丸ごと dist へコピーするので、置きっぱなしだと本番に載る
 data/problems/*/_batches/
+.env*

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use shared::language::Language;
+use shared::runner::{run_plan, LOCAL_IMAGE};
 
 /// 1 問につき 2 通り実行する: 模範解答は通り、初期コードは落ちること。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,22 +56,21 @@ pub struct DockerRun {
 }
 
 /// 1 ケースあたりの実行上限。無限ループを書いた問題でバッチが止まらないようにする。
-pub const CASE_TIMEOUT_SECS: u64 = 20;
+/// 本番 (Sandbox) と同じ値を使う (正本は shared::runner)。
+pub const CASE_TIMEOUT_SECS: u64 = shared::runner::CASE_TIMEOUT_SECS;
 /// コンテナ全体の上限。ケース数に比例させる。
 pub const OVERALL_TIMEOUT_BASE_SECS: u64 = 120;
 
 /// バッチをコンテナ何回で回すかの計画を返す。**実行はしない。**
 ///
-/// Rust はローカル cargo の方が速いので Docker に載せない (空の計画を返す)。
+/// 7 言語すべて本番と同じ 1 枚のイメージ (`shared::runner::LOCAL_IMAGE`) で回す。
+/// 以前は言語ごとに別イメージで、Rust だけローカル cargo だった (ADR 0002)。
 pub fn plan_batch(language: Language, cases: &[RunCase], workdir: &Path) -> Vec<DockerRun> {
     if cases.is_empty() {
         return Vec::new();
     }
-    let Some(image) = language.verify_image() else {
-        return Vec::new(); // Rust
-    };
     vec![DockerRun {
-        image: image.to_string(),
+        image: LOCAL_IMAGE.to_string(),
         workdir: workdir.to_path_buf(),
         script: container_script(language, cases),
         network_disabled: true,
@@ -80,47 +80,49 @@ pub fn plan_batch(language: Language, cases: &[RunCase], workdir: &Path) -> Vec<
 
 /// コンテナ内で走らせる sh スクリプトを組む。
 ///
-/// 各ケースのディレクトリで「コンパイル → 実行」を行い、`_stdout` / `_stderr` / `_exit`
-/// に結果を残す。stdout と stderr を混ぜないのは、正解の目印 (`test result: ok`) が
-/// stdout にあることを判定条件にしているため。
+/// **コマンドは `shared::runner::run_plan` から取る。** ここに言語別のコマンドを
+/// 書くと本番 (Sandbox) との二重管理になり、2026-08-29 の TypeScript target ずれ
+/// (「verifier は緑なのに本番は TS2550」) と同じ事故が再発する。
+///
+/// 各ケースのディレクトリで「準備 → コンパイル → 実行」を行い、`_stdout` / `_stderr` /
+/// `_exit` に結果を残す。stdout と stderr を混ぜないのは、正解の目印
+/// (`test result: ok`) が stdout にあることを判定条件にしているため。
 pub fn container_script(language: Language, cases: &[RunCase]) -> String {
-    let src = language.source_file_name();
+    let plan = run_plan(language);
     let t = CASE_TIMEOUT_SECS;
 
-    // 1 ケース分の「コンパイルして実行する」コマンド。
+    // 1 ケース分の「準備してコンパイルして実行する」コマンド列。
     // 出力は呼び出し側でリダイレクトする。
-    let run_one = match language {
-        Language::Cpp => format!("g++ -std=c++17 -w -o _prog {src} && ./_prog"),
-        Language::Java => format!("javac -nowarn {src} && java Main"),
-        Language::Python => format!("python3 {src}"),
-        Language::Javascript => format!("node {src}"),
-        // target を上流 (Wandbox) と揃える。ここだけ es2020 にすると、
-        // ES2019+ の API を使う模範解答が「ローカルは緑・本番は TS2339」になる
-        Language::Typescript => format!("tsc {} {src} && node prog.js", shared::language::tsc_flags_cli()),
-        // C# はプロジェクトが要る。プロジェクト作成はループの外で 1 回だけ行う
-        Language::Csharp => format!(
-            // dotnet build の診断は stdout に出る。>/dev/null に流すと、answer が落ちたときに
-            // 作者へ何も見せられなくなる (「実物の診断を読む」設計が検証側だけ死ぬ)
-            "cp {src} /proj/Program.cs && (cd /proj && dotnet build -v q --nologo -o /proj/_out) && dotnet /proj/_out/proj.dll"
-        ),
-        Language::Rust => String::new(), // Docker では走らせない
-    };
+    let run_one = [plan.prepare, plan.compile, Some(plan.run)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" && ");
 
-    let mut s = String::from("#!/bin/sh\n# 自動生成 (verifier)\n");
-    if language == Language::Csharp {
-        s.push_str(
-            "export DOTNET_CLI_TELEMETRY_OPTOUT=1\nexport DOTNET_NOLOGO=1\nexport DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1\n\
-             dotnet new console -o /proj >/dev/null 2>&1\n",
-        );
-    }
+    let mut s = String::from("#!/bin/sh
+# 自動生成 (verifier)
+");
+    // ひな形の cargo / dotnet が書き込める場所を与える (イメージ内の /opt は読み取り専用扱い)
+    s.push_str(
+        "export HOME=${HOME:-/tmp}
+\
+         export DOTNET_CLI_TELEMETRY_OPTOUT=1
+\
+         export DOTNET_NOLOGO=1
+\
+         export DOTNET_CLI_HOME=/tmp
+",
+    );
 
     for case in cases {
         let dir = case.dir_name();
         s.push_str(&format!(
-            "cd /w/cases/{dir} 2>/dev/null && {{ timeout {t} sh -c '{run_one}' >_stdout 2>_stderr; echo $? >_exit; }}\n"
+            "cd /w/cases/{dir} 2>/dev/null && {{ timeout {t} sh -c '{run_one}' >_stdout 2>_stderr; echo $? >_exit; }}
+"
         ));
     }
-    s.push_str("exit 0\n");
+    s.push_str("exit 0
+");
     s
 }
 
@@ -144,9 +146,9 @@ pub fn execute(run: &DockerRun) -> std::io::Result<std::process::Output> {
     cmd.output()
 }
 
-/// Docker と必要なイメージが揃っているかを着手時に 1 回だけ検査する。
+/// Docker と実行イメージが揃っているかを着手時に 1 回だけ検査する。
 /// 揃っていないまま進むと「検証したつもりの未検証データ」が積み上がる。
-pub fn preflight(languages: &[Language]) -> Result<(), String> {
+pub fn preflight() -> Result<(), String> {
     let ok = Command::new("docker")
         .arg("info")
         .output()
@@ -155,24 +157,17 @@ pub fn preflight(languages: &[Language]) -> Result<(), String> {
     if !ok {
         return Err("docker が使えません (デーモンが起動しているか確認してください)".into());
     }
-    let mut missing = Vec::new();
-    for l in languages {
-        let Some(image) = l.verify_image() else { continue };
-        let found = Command::new("docker")
-            .args(["image", "inspect", image])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !found {
-            missing.push(format!("{} ({})", image, l.slug()));
-        }
-    }
-    if missing.is_empty() {
+    let found = Command::new("docker")
+        .args(["image", "inspect", LOCAL_IMAGE])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if found {
         Ok(())
     } else {
         Err(format!(
-            "検証イメージがありません: {}\n  docker pull で取得してください (knocks-ts:5.6.2 は node:20 + typescript@5.6.2 の自前ビルド)",
-            missing.join(", ")
+            "実行イメージ {LOCAL_IMAGE} がありません。
+  bash scripts/build-runner-image.sh で作ってください (本番と同じ Dockerfile から作られます)"
         ))
     }
 }

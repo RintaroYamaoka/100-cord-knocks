@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use shared::language::Language;
 use shared::problem::{problems_rel_path, Level, Problem};
 use verifier::docker::CaseKind;
-use verifier::{load_problems_str, run_batch_docker, run_problem_rust};
+use verifier::{load_problems_str, run_batch_docker};
 
 struct Job {
     path: PathBuf,
@@ -75,46 +75,10 @@ fn verify_job(job: &Job, scratch: &PathBuf, totals: &mut Totals) -> Vec<Problem>
         return Vec::new();
     }
 
-    if job.language == Language::Rust {
-        verify_rust(&problems, scratch, totals);
-    } else {
-        verify_via_docker(job, &problems, scratch, totals);
-    }
+    // 7 言語とも本番と同じイメージで検証する (ADR 0003)。
+    // 以前は Rust だけローカル cargo だったが、ホストと本番の rustc がずれる
+    verify_via_docker(job, &problems, scratch, totals);
     problems
-}
-
-fn verify_rust(problems: &[Problem], scratch: &PathBuf, totals: &mut Totals) {
-    for p in problems {
-        totals.verified += 1;
-        let answer = run_problem_rust(scratch, &p.answer_code, &p.hidden_tests);
-        match answer {
-            Ok(o) if o.passed => {}
-            Ok(o) => {
-                eprintln!("✗ [{}] answer_code がテストを通りません:\n{}", p.id, tail(&o.output));
-                totals.failed += 1;
-                continue;
-            }
-            Err(e) => {
-                eprintln!("✗ [{}] 実行失敗: {e}", p.id);
-                totals.failed += 1;
-                continue;
-            }
-        }
-        match run_problem_rust(scratch, &p.starter_code, &p.hidden_tests) {
-            Ok(o) if !o.passed => {}
-            Ok(_) => {
-                eprintln!("✗ [{}] starter_code のままテストが通ってしまいます", p.id);
-                totals.failed += 1;
-                continue;
-            }
-            Err(e) => {
-                eprintln!("✗ [{}] 実行失敗: {e}", p.id);
-                totals.failed += 1;
-                continue;
-            }
-        }
-        println!("✓ {}", p.id);
-    }
 }
 
 fn verify_via_docker(job: &Job, problems: &[Problem], scratch: &PathBuf, totals: &mut Totals) {
@@ -254,18 +218,10 @@ fn main() -> ExitCode {
 
     // 実行環境の前提を着手時に 1 回だけ検査する。
     // 揃わないまま進むと「検証したつもりの未検証データ」が積み上がる
-    let needs_docker: Vec<Language> = jobs
-        .iter()
-        .map(|j| j.language)
-        .filter(|l| l.verify_image().is_some())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    if !needs_docker.is_empty() {
-        if let Err(e) = verifier::docker::preflight(&needs_docker) {
-            eprintln!("✗ 実行環境の前提が満たされていません:\n  {e}");
-            return ExitCode::FAILURE;
-        }
+    if let Err(e) = verifier::docker::preflight() {
+        eprintln!("✗ 実行環境の前提が満たされていません:
+  {e}");
+        return ExitCode::FAILURE;
     }
 
     let mut totals = Totals::default();

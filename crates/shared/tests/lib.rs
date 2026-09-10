@@ -1,10 +1,8 @@
 //! 公開 API を通した統合スモーク: 問題 → 提出コード合成 → 実行結果分類までの一連の流れ。
 
 use shared::language::Language;
-use shared::playground::{
-    classify, normalize_playground, normalize_wandbox, ExecuteRequest, Outcome, PlaygroundResponse,
-    WandboxResponse,
-};
+use shared::contract::{classify, ExecuteRequest, Outcome};
+use shared::runner::{normalize_runner, RunnerOutput};
 use shared::problem::compose_submission;
 
 #[test]
@@ -16,12 +14,13 @@ fn rust_submission_flow_composes_and_classifies() {
     assert_eq!(req.language, Language::Rust);
     assert!(req.code.contains("pub fn answer"));
 
-    let raw = PlaygroundResponse {
-        success: false,
-        stdout: "running 1 test\ntest t ... FAILED\n\ntest result: FAILED. 0 passed; 1 failed".into(),
-        stderr: "   Compiling playground v0.0.1\n    Finished dev profile".into(),
+    let raw = RunnerOutput {
+        program_stdout: "running 1 test\ntest t ... FAILED\n\ntest result: FAILED. 0 passed; 1 failed".into(),
+        program_stderr: "error: test failed, to rerun pass `--lib`".into(),
+        exit_code: Some(101),
+        ..Default::default()
     };
-    assert_eq!(classify(&normalize_playground(&raw)), Outcome::TestsFailed);
+    assert_eq!(classify(&normalize_runner(Language::Rust, &raw)), Outcome::TestsFailed);
 }
 
 #[test]
@@ -32,23 +31,23 @@ fn python_submission_flow_composes_and_classifies() {
     // 区切りが `#` でないと、この提出コードは実行前に SyntaxError になる
     assert!(submission.contains("# ====="));
 
-    let raw = WandboxResponse {
-        status: "1".into(),
-        program_output: "test result: FAILED\n".into(),
+    let raw = RunnerOutput {
+        program_stdout: "test result: FAILED\n".into(),
+        exit_code: Some(1),
         ..Default::default()
     };
-    assert_eq!(classify(&normalize_wandbox(Language::Python, &raw)), Outcome::TestsFailed);
+    assert_eq!(classify(&normalize_runner(Language::Python, &raw)), Outcome::TestsFailed);
 }
 
 #[test]
 fn every_language_can_round_trip_a_passing_run() {
     for lang in Language::ALL {
-        let raw = WandboxResponse {
-            status: "0".into(),
-            program_output: "test result: ok\n".into(),
+        let raw = RunnerOutput {
+            program_stdout: "test result: ok\n".into(),
+            exit_code: Some(0),
             ..Default::default()
         };
-        let resp = normalize_wandbox(lang, &raw);
+        let resp = normalize_runner(lang, &raw);
         assert_eq!(classify(&resp), Outcome::Passed, "{}", lang.slug());
     }
 }

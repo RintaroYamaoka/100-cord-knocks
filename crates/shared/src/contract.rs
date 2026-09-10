@@ -1,12 +1,12 @@
 //! 実行契約 — フロント / プロキシ / verifier が共有する。
 //!
-//! フロントは `{language, code}` だけを送り、プロキシが言語ごとの上流
-//! (Playground / Wandbox) に翻訳して、結果を `ExecuteResponse` に詰め替える。
-//! 判定契約とバックエンド選定の正本は ADR 0002。
+//! フロントは `{language, code}` だけを送り、プロキシが Vercel Sandbox で実行して、
+//! 結果を `ExecuteResponse` に詰め替える。判定契約の正本は ADR 0002、
+//! 実行基盤の正本は ADR 0003。実行コマンドそのものは `shared::runner`。
 
 use serde::{Deserialize, Serialize};
 
-use crate::language::{Backend, Language};
+use crate::language::Language;
 
 /// 提出コードの上限。上流へのプロキシ時に DoS 的な巨大ペイロードを弾く。
 pub const MAX_CODE_BYTES: usize = 64 * 1024;
@@ -123,17 +123,6 @@ pub fn has_compile_error(language: Language, diagnostics: &str) -> bool {
     diagnostics.lines().any(|line| is_error_line(language, line))
 }
 
-/// その言語に「実行前の独立したコンパイル段階」があるか。
-///
-/// Python と JavaScript には無く、構文エラーはインタプリタ起動時に
-/// **プログラムの stderr** に出る。したがってこの 2 言語だけは、上流の診断欄が
-/// 空でもプログラムの stderr を構文エラーとして走査する必要がある。
-/// これをしないと、構文エラーが `RuntimeError` に落ちて
-/// 「未実装で落ちた」のか「構文が壊れている」のか利用者に伝わらない (実測で判明)。
-pub fn has_separate_compile_phase(language: Language) -> bool {
-    !matches!(language, Language::Python | Language::Javascript)
-}
-
 /// 1 行がその言語のエラー診断かどうか。
 ///
 /// rustc は行頭が `error`、gcc / javac は `file:line:col: error:`、
@@ -176,6 +165,7 @@ pub fn strip_csharp_build_noise(s: &str) -> String {
     ];
 
     s.lines()
+        .map(strip_msbuild_project_suffix)
         .filter(|line| {
             let t = line.trim();
             if t.is_empty() {
@@ -199,184 +189,19 @@ pub fn strip_csharp_build_noise(s: &str) -> String {
         .join("\n")
 }
 
-// ---- Wandbox ----
-
-/// wandbox.org/api/compile.json への送信形。
-#[derive(Serialize, Debug, Clone, PartialEq)]
-pub struct WandboxRequest {
-    pub compiler: String,
-    pub code: String,
-    /// コンパイラごとに定義された**選択肢の ID** (例: gcc の "warning,c++17")。生フラグではない。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub options: Option<String>,
-    /// 生のコンパイラフラグ (改行区切り)。選択肢が用意されていないコンパイラは
-    /// こちらでしかフラグを渡せない (typescript がそれ)。
-    #[serde(rename = "compiler-option-raw", skip_serializing_if = "Option::is_none")]
-    pub compiler_option_raw: Option<String>,
-    pub save: bool,
-}
-
-/// Wandbox の応答形 (実測したフィールドのみ)。
-#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
-pub struct WandboxResponse {
-    #[serde(default)]
-    pub status: String,
-    #[serde(default)]
-    pub signal: String,
-    #[serde(default)]
-    pub compiler_output: String,
-    #[serde(default)]
-    pub compiler_error: String,
-    #[serde(default)]
-    pub program_output: String,
-    #[serde(default)]
-    pub program_error: String,
-}
-
-/// Wandbox が HTTP レベルで失敗したとき、それが「上流の一時障害」かどうか。
+/// `prog.cs(2,67): error CS0029: ... [/tmp/xxxx/knocks.csproj]` の末尾を落とす。
 ///
-/// 2026-09-07 の障害では、Wandbox が全コンパイラで HTTP 500 と
-/// `Error: Failed to get uid: status=exit status: 125, base_dir=/tmp/wandbox/...`
-/// (サーバー側のコンテナランタイム起動失敗) を返し続けた。これは利用者のコードとも
-/// こちらのリクエストとも無関係なので、5xx は再試行したうえで「停止中」として返す。
-/// 4xx (リクエスト不正・403 など) は再試行しても無駄なので一時障害とはみなさない。
-pub fn wandbox_http_failure_is_transient(status: u16, body: &str) -> bool {
-    (500..600).contains(&status) || body.contains("Failed to get uid")
-}
-
-impl WandboxResponse {
-    /// 上流が一時的に落ちている (過負荷) ときの応答か。
-    /// これをコンパイルエラーとして見せると、正しいコードが赤く出て学習者が混乱する。
-    pub fn is_upstream_transient_error(&self) -> bool {
-        self.compiler_error.contains("OCI runtime error")
-            || self.compiler_error.contains("Resource temporarily unavailable")
+/// 自前イメージの `dotnet build` は診断行の末尾にプロジェクトファイルの絶対パスを
+/// 付ける。利用者には無意味なうえ、実行環境の一時ディレクトリ名が漏れる。
+/// 診断の本体 (`error CSnnnn: ...`) は必ず残す。
+fn strip_msbuild_project_suffix(line: &str) -> String {
+    let trimmed = line.trim_end();
+    if !trimmed.ends_with(".csproj]") {
+        return line.to_string();
     }
-
-    /// シグナルで殺された実行か (SIGKILL によるメモリ超過、SIGSEGV など)。
-    /// 上流は status を空文字にすることがあるので、シグナルの有無も見ないと
-    /// 「異常終了なのに Passed」の経路が残る。
-    pub fn killed_by_signal(&self) -> bool {
-        !self.signal.trim().is_empty()
-    }
-}
-
-/// `Language` に対応する Wandbox リクエストを組む。Rust (Playground) には None。
-pub fn wandbox_request(language: Language, code: &str) -> Option<WandboxRequest> {
-    match language.backend() {
-        Backend::Playground => None,
-        Backend::Wandbox { compiler, options } => Some(WandboxRequest {
-            compiler: compiler.to_string(),
-            code: code.to_string(),
-            options: options.map(String::from),
-            // typescript には選択肢が無いので生フラグで target を指定する。
-            // ここを渡し忘れると ES2019+ の API を使う正解が TS2550 で落ちる
-            compiler_option_raw: match language {
-                Language::Typescript => Some(crate::language::tsc_flags_wandbox_raw()),
-                _ => None,
-            },
-            save: false,
-        }),
-    }
-}
-
-/// Wandbox の応答を `ExecuteResponse` に詰め替える。
-///
-/// 診断 (compiler_*) とプログラム出力 (program_*) を分けて扱い、`compile_failed` は
-/// **診断テキストだけ**から決める。両者を混ぜてから判定すると、プログラムが
-/// "error" を印字しただけでコンパイルエラーになる。
-pub fn normalize_wandbox(language: Language, raw: &WandboxResponse) -> ExecuteResponse {
-    // TypeScript の型エラーは compiler_output に、gcc/javac は compiler_error に来る
-    let mut diagnostics = String::new();
-    for part in [&raw.compiler_error, &raw.compiler_output] {
-        if !part.trim().is_empty() {
-            if !diagnostics.is_empty() {
-                diagnostics.push('\n');
-            }
-            diagnostics.push_str(part.trim_end());
-        }
-    }
-    if language == Language::Csharp {
-        diagnostics = strip_csharp_build_noise(&diagnostics);
-    }
-
-    // Python / JavaScript は構文エラーがプログラムの stderr に出るので、そこも走査する。
-    // コンパイル段階を持つ言語では走査しない (プログラムが "error:" を印字しただけで
-    // コンパイルエラーと誤判定してしまうため)。
-    // 判定テストが走ったなら、その時点でコンパイルは成功している。
-    // 診断にエラー行が残っていても (警告扱いの行やランナーの要約) コンパイルエラーにしない。
-    let compile_failed = !harness_ran(&raw.program_output)
-        && (has_compile_error(language, &diagnostics)
-            || (!has_separate_compile_phase(language)
-                && has_compile_error(language, &raw.program_error)));
-
-    let mut stderr = diagnostics;
-    if !raw.program_error.trim().is_empty() {
-        if !stderr.is_empty() {
-            stderr.push('\n');
-        }
-        stderr.push_str(raw.program_error.trim_end());
-    }
-
-    ExecuteResponse {
-        // シグナルで殺された実行は成功にしない
-        success: raw.status == "0" && !raw.killed_by_signal(),
-        stdout: raw.program_output.clone(),
-        stderr,
-        compile_failed,
-    }
-}
-
-// ---- Playground (Rust) ----
-
-/// play.rust-lang.org/execute への送信形。
-#[derive(Serialize, Debug, Clone, PartialEq)]
-pub struct PlaygroundRequest {
-    pub channel: String,
-    pub mode: String,
-    pub edition: String,
-    #[serde(rename = "crateType")]
-    pub crate_type: String,
-    pub tests: bool,
-    pub code: String,
-    pub backtrace: bool,
-}
-
-impl PlaygroundRequest {
-    /// 正誤判定: ユーザーコード + `#[test]` 群を tests モードで実行する。
-    pub fn judge(code: &str) -> Self {
-        Self {
-            channel: "stable".into(),
-            mode: "debug".into(),
-            edition: "2024".into(),
-            crate_type: "lib".into(),
-            tests: true,
-            code: code.to_string(),
-            backtrace: false,
-        }
-    }
-}
-
-/// Playground の応答形。
-#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
-pub struct PlaygroundResponse {
-    #[serde(default)]
-    pub success: bool,
-    #[serde(default)]
-    pub stdout: String,
-    #[serde(default)]
-    pub stderr: String,
-}
-
-/// Playground の応答を `ExecuteResponse` に詰め替える。
-pub fn normalize_playground(raw: &PlaygroundResponse) -> ExecuteResponse {
-    ExecuteResponse {
-        success: raw.success,
-        stdout: raw.stdout.clone(),
-        stderr: raw.stderr.clone(),
-        // cargo test はテスト失敗時に stderr へ `error: test failed` を出す。
-        // 判定テストが走った証拠があるならコンパイルは通っている
-        compile_failed: !harness_ran(&raw.stdout)
-            && has_compile_error(Language::Rust, &raw.stderr),
+    match trimmed.rfind(" [") {
+        Some(at) => trimmed[..at].to_string(),
+        None => line.to_string(),
     }
 }
 

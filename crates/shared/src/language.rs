@@ -1,5 +1,8 @@
-//! 対応言語と、その言語がどの実行バックエンドで動くか。
-//! バックエンド選定とコンパイラ ID の正本は ADR 0002。
+//! 対応言語の定義。
+//!
+//! 実行基盤は 7 言語すべて Vercel Sandbox (自前イメージ) に統一したので、
+//! ここに言語ごとのバックエンド分岐は無い。実行コマンドの正本は `shared::runner`、
+//! 実行基盤の決定は ADR 0003 (ADR 0002 を改訂)。
 
 use serde::{Deserialize, Serialize};
 
@@ -15,38 +18,17 @@ pub enum Language {
     Javascript,
 }
 
-/// TypeScript のコンパイラフラグ。**上流 (Wandbox) と検証 (ローカル Docker) で必ず同じものを使う。**
+/// TypeScript のコンパイラフラグ。
 ///
-/// ここが食い違うと、`Object.fromEntries` のような ES2019+ の API を使う模範解答が
-/// 「ローカルの verifier は緑なのに本番では TS2550 で落ちる」という、
-/// 最も気づきにくい形で壊れる (2026-08-29 に実測で確認)。
+/// 本番と検証が同じイメージ・同じコマンド (`shared::runner`) を使うようになったので
+/// 食い違いは構造的に起きないが、版の意図を残すために定数はここに置いたままにする。
+/// 食い違っていた時代は、`Object.fromEntries` のような ES2019+ の API を使う模範解答が
+/// 「ローカルの verifier は緑なのに本番では TS2550 で落ちる」形で壊れた (2026-08-29 実測)。
 pub const TSC_FLAGS: &[&str] = &["--target", "es2020"];
 
 /// ローカル Docker で `tsc` に渡す形 (空白区切り)。
 pub fn tsc_flags_cli() -> String {
     TSC_FLAGS.join(" ")
-}
-
-/// Wandbox に渡す形。
-///
-/// Wandbox の `options` は**コンパイラごとに定義された選択肢の ID** であって生のフラグではない。
-/// typescript-5.6.2 には選択肢が 1 つも無く、生フラグは `compiler-option-raw`
-/// (改行区切り) でしか渡せない。`options` に `--target es2020` を入れても黙って無視される。
-pub fn tsc_flags_wandbox_raw() -> String {
-    TSC_FLAGS.join("\n")
-}
-
-/// 実行を委譲する上流サービス。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Backend {
-    /// play.rust-lang.org/execute (Rust のみ)
-    Playground,
-    /// wandbox.org/api/compile.json
-    Wandbox {
-        compiler: &'static str,
-        /// Wandbox の `options` (コンパイラフラグ)。不要なら None。
-        options: Option<&'static str>,
-    },
 }
 
 impl Language {
@@ -104,55 +86,11 @@ impl Language {
         }
     }
 
-    /// 提出コードをどこで実行するか (ADR 0002)。
-    pub fn backend(self) -> Backend {
-        match self {
-            Language::Rust => Backend::Playground,
-            Language::Cpp => Backend::Wandbox {
-                compiler: "gcc-13.2.0",
-                options: Some("warning,c++17"),
-            },
-            Language::Csharp => Backend::Wandbox {
-                compiler: "dotnetcore-6.0.425",
-                options: None,
-            },
-            Language::Java => Backend::Wandbox {
-                compiler: "openjdk-jdk-22+36",
-                options: None,
-            },
-            Language::Python => Backend::Wandbox {
-                compiler: "cpython-3.13.8",
-                options: None,
-            },
-            Language::Typescript => Backend::Wandbox {
-                compiler: "typescript-5.6.2",
-                options: None,
-            },
-            Language::Javascript => Backend::Wandbox {
-                compiler: "nodejs-20.17.0",
-                options: None,
-            },
-        }
-    }
-
-    /// 検証 (verifier) で使う Docker イメージ。Rust はローカル cargo なので None。
-    /// 版は backend() の上流コンパイラに合わせてある (ADR 0002)。
-    pub fn verify_image(self) -> Option<&'static str> {
-        match self {
-            Language::Rust => None,
-            Language::Cpp => Some("gcc:13"),
-            Language::Csharp => Some("mcr.microsoft.com/dotnet/sdk:6.0"),
-            Language::Java => Some("eclipse-temurin:22-jdk"),
-            Language::Python => Some("python:3.13"),
-            Language::Typescript => Some("knocks-ts:5.6.2"),
-            Language::Javascript => Some("node:20"),
-        }
-    }
-
-    /// 提出コードのファイル名。上流・検証コンテナの双方で同じ名前を使う。
+    /// 提出コードのファイル名。本番 (Sandbox) と検証 (ローカル Docker) で同じ名前を使う。
     ///
-    /// Java が `prog.java` なのは Wandbox の制約で、これが「問題中のクラスを
-    /// public にできない」理由になっている (ADR 0002)。
+    /// Java が `prog.java` なのは Wandbox 時代の制約の名残り。自前イメージでは
+    /// 任意の名前にできるが、既存 300 問が「クラスを public にしない」前提で
+    /// 書かれているため名前を変えていない (変えるなら 300 問の再検証が要る)。
     pub fn source_file_name(self) -> &'static str {
         match self {
             Language::Rust => "lib.rs",

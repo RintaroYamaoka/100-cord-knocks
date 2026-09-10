@@ -17,8 +17,12 @@ Vercel にデプロイ(静的 WASM フロント + Rust Functions)。
 - エディタ: CodeMirror 6(`assets/js/editor.js` は esbuild 生成物、ソースは `editor-src.mjs`)。
   言語モードは `window.RustKnocksEditor.setLanguage(slug)` で切り替える
 - バックエンド: Vercel **公式** Rust ランタイム (`vercel_runtime = "2"`, hyper 1 ベース)。
-  `api/execute.rs` が **Rust → play.rust-lang.org / 他 6 言語 → wandbox.org** に振り分ける。
+  `api/execute.rs` が **7 言語すべてを Vercel Sandbox (自前イメージ `knocks-runtime`)** で
+  実行する (ADR 0003)。公式 SDK は JS/Python のみなので REST API を reqwest で直接叩く。
   `vercel.json` に `functions.runtime` は書かない (Cargo.toml の `[[bin]]` を自動検出)
+- 実行イメージ: `docker/runner/Dockerfile` が 7 言語のツールチェーンを 1 枚に焼く。
+  **本番 (Sandbox) と verifier (ローカル Docker) が同じイメージ・同じコマンド定義
+  (`shared::runner`) を使う**。これが「verifier は緑なのに本番は落ちる」を構造的に消す
 - 問題データ: `data/problems/<言語>/<難易度>.json`(静的配信)。スキーマは `crates/shared`
 - 進捗保存: ブラウザ localStorage(サーバー状態なし)。キーは `<言語>/<問題id>`
 - テスト: cargo test(workspace)。問題コンテンツの品質検証は `crates/verifier`
@@ -29,6 +33,11 @@ Vercel にデプロイ(静的 WASM フロント + Rust Functions)。
 # テスト実行
 cargo test --workspace --exclude app   # 契約層・プロキシ・verifier
 cargo test -p app                      # フロントの純ロジック (host でコンパイルできる範囲)
+
+# 実行イメージ (7 言語のツールチェーン)。verifier と本番で同じものを使う
+bash scripts/build-runner-image.sh                  # ローカルに knocks-runtime:local
+bash scripts/build-runner-image.sh --push 2026-09-11 # VCR へ push (★個人アカウント専用)
+cargo test -p shared --test runner_docker -- --ignored --nocapture  # 7 言語スモーク
 
 # 問題コンテンツ検証 (実コンパイラを Docker で回す)
 cargo run -p verifier                            # 全 2100 問
@@ -48,6 +57,7 @@ trunk serve            # :8080 でフロント (API は vercel dev へプロキ�
 ├── crates/app/       # Leptos フロントエンド (wasm32)
 ├── crates/verifier/  # 問題品質検証ハーネス (docker.rs が docker run を組み立てる唯一の場所)
 ├── api/              # Vercel Rust Functions (execute.rs)
+├── docker/runner/    # 実行イメージの Dockerfile (本番 Sandbox と verifier が共用)
 ├── data/problems/    # 問題データ JSON (<言語>/<難易度>.json の 21 ファイル)
 ├── assets/           # CSS / JS glue / CodeMirror バンドル
 └── docs/             # ADR + bootstrap 規律 (handoffs/incidents/sprint/verification/commission)
@@ -59,7 +69,8 @@ trunk serve            # :8080 でフロント (API は vercel dev へプロキ�
 - 依存方向: `app` / `api` / `verifier` → `shared`。逆依存禁止。API 契約 (`ExecuteRequest/Response`)、
   問題スキーマ (`Problem`)、言語定義 (`Language`) の変更は必ず `shared` で行う
 - 正誤判定はサーバー側に状態を持たない: ユーザーコード + `hidden_tests` を結合して実行し、
-  **終了コードと stdout の目印**で分類する。判定順序と言語別の制約は ADR 0002 が正本
+  **終了コードと stdout の目印**で分類する。判定順序と言語別の制約は ADR 0002 が正本、
+  実行基盤 (Sandbox への統一) は ADR 0003 が正本
 - `crates/app` は wasm32 専用ターゲット。純ロジック(フィルタ・進捗集計・出力パース)は
   host でもテストできるよう UI から分離して書く
 - 画面は同じ DOM のまま、**幅で 2 つのレイアウトを切り替える**: 広い画面は 3 ペイン
@@ -75,19 +86,31 @@ trunk serve            # :8080 でフロント (API は vercel dev へプロキ�
   Python の問題が実行前に SyntaxError で全滅する
 - **進捗は必ず `progress_key` / `&Problem` を取る関数を通す**。素の `p.id` で引いても型は通り、
   症状は「一覧の進捗色が静かに全部消える」だけなので気づけない
-- **Java の問題でクラスを `public` にしない**。Wandbox のファイル名が `prog.java` 固定のため
+- **Java の問題でクラスを `public` にしない**。ソースを `prog.java` に置く運用のままなので
   `class X is public, should be declared in a file named X.java` で落ちる
-- **C# は `dotnetcore-6.0.425`**。`dotnetcore-8.0.402` は Wandbox 側で `dotnet new` が
-  `File size limit exceeded` で落ちる。成功時も MSBuild の定型出力が出るのでプロキシで除去している
-- **Wandbox は既定 User-Agent を 403 で弾く**。過負荷時は `OCI runtime error` を返すので、
-  コンパイルエラーとして見せずに再試行 → 503 で返す
-- **Wandbox 全体が落ちることがある** (2026-09-07: 全コンパイラで HTTP 500
-  `Failed to get uid: status=exit status: 125`)。Rust 以外の 6 言語が一斉に失敗したら、
-  まず `curl -A x -X POST https://wandbox.org/api/compile.json` で上流に直接投げて切り分ける。
-  プロキシは 5xx を再試行して 503「Wandbox が一時的に停止しています」で返す。
-  復旧すれば再デプロイ不要。詳細: `docs/bootstrap/incidents/2026-09-07-wandbox-outage-shown-as-502.md`
-- Playground / Wandbox は非公式・レート制限あり。問題コンテンツの検証は必ず `verifier`
-  (ローカル Docker) で行い、上流に一括負荷をかけない
+  (Wandbox 時代の制約の名残り。変えるなら Java 300 問の再検証が要る)
+- **C# は dotnet SDK 6.0.428 固定**。版を上げるのは自由になったが (Wandbox の制約は消えた)、
+  C# 300 問はこの版で検証済みなので、上げるなら `verifier -- --lang csharp` を通してから。
+  `dotnet build` の定型出力と `[/tmp/.../knocks.csproj]` 接尾辞はプロキシで除去している
+- **Sandbox 作成に `persistent: false` を必ず付ける**。既定は true で、停止のたびに自動
+  スナップショットが作られる。Hobby のスナップショット保存は**生涯 15GB** なので、
+  4.5GB のイメージだと数回で枯れて作成が止まる
+- **Hobby の枠が実行回数の上限**: 作成 5,000 回/月・Active CPU 5 時間/月・同時 10。
+  超えると課金ではなく**次サイクルまで作成が停止**する。プロキシは専用の文言
+  (「今月の無料枠を使い切りました」) で返す。使用量は Vercel の Usage で見る
+- **イメージの版を上げたら 2100 問を再検証する**。タグの正本は
+  `shared::runner::PRODUCTION_IMAGE`。本番は環境変数 `KNOCKS_SANDBOX_IMAGE` で切り戻せる
+- **イメージの push は個人アカウントで**。`scripts/build-runner-image.sh` が `vercel whoami` と
+  `VERCEL_TOKEN` の不在を検査してから動く。CLI 54 系には `vercel vcr` が無いので、
+  `printf %s "$VERCEL_OIDC_TOKEN" | docker login vcr.vercel.com -u oidc --password-stdin` →
+  `docker push vcr.vercel.com/rintaro-yamaokas-projects/100-cord-knocks/knocks-runtime:<tag>`
+- **判定の偽装対策を弱めない**: 出力のセクション区切りは実行ごとの nonce (getrandom)、
+  パーサは**後勝ち**で読む、提出コードは base64 で埋める。先勝ちに戻すと
+  `<nonce>:exit\n0` を印字するだけで不正解が正解になる
+- **Sandbox の認証は OIDC で、`projectId` は送らない**。トークンがプロジェクトに紐づくので
+  上流が解決する (本番の関数環境にプロジェクト ID は渡ってこない)
+- 問題コンテンツの検証は必ず `verifier` (ローカル Docker) で行う。本番の Sandbox に
+  2100 問を流すと Hobby の枠を 1 回で使い切る
 - **verifier の検査を弱めない**。通らない問題は検査を消すのではなく問題を作り直す
 - Vercel ビルドで `cargo install trunk` は遅すぎる。`scripts/build-frontend.sh` は
   prebuilt バイナリをダウンロードする

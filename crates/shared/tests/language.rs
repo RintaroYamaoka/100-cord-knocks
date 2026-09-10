@@ -1,4 +1,4 @@
-use shared::language::{Backend, Language};
+use shared::language::Language;
 
 #[test]
 fn slug_roundtrips() {
@@ -31,28 +31,6 @@ fn json_representation_matches_slug() {
         assert_eq!(json, format!("\"{}\"", l.slug()));
         let back: Language = serde_json::from_str(&json).unwrap();
         assert_eq!(back, l);
-    }
-}
-
-#[test]
-fn only_rust_uses_playground() {
-    for l in Language::ALL {
-        match (l, l.backend()) {
-            (Language::Rust, Backend::Playground) => {}
-            (Language::Rust, _) => panic!("Rust は Playground のはず"),
-            (_, Backend::Playground) => panic!("{} が Playground を使っている", l.slug()),
-            (_, Backend::Wandbox { compiler, .. }) => {
-                assert!(!compiler.is_empty(), "{} の compiler が空", l.slug())
-            }
-        }
-    }
-}
-
-#[test]
-fn every_non_rust_language_has_a_verify_image() {
-    assert_eq!(Language::Rust.verify_image(), None, "Rust はローカル cargo で検証する");
-    for l in Language::ALL.into_iter().filter(|l| *l != Language::Rust) {
-        assert!(l.verify_image().is_some(), "{} に検証イメージが無い", l.slug());
     }
 }
 

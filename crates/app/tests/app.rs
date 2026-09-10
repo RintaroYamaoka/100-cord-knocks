@@ -4,7 +4,7 @@
 use app::app::code_for;
 use app::next_status;
 use shared::language::Language;
-use shared::playground::Outcome;
+use shared::contract::Outcome;
 use shared::problem::{Level, Problem};
 use shared::progress::{progress_key, ProblemStatus, ProgressEntry, ProgressMap};
 

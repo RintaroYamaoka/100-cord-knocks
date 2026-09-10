@@ -6,7 +6,7 @@ use std::rc::Rc;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use shared::language::Language;
-use shared::playground::{classify, ExecuteRequest, Outcome};
+use shared::contract::{classify, ExecuteRequest, Outcome};
 use shared::problem::{compose_submission, Level, Problem};
 use shared::progress::{
     passed_count, progress_key, saved_code_of, status_of, ProblemStatus, ProgressEntry, ProgressMap,

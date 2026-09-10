@@ -77,11 +77,9 @@ fn error_code_links_are_rust_only() {
 
 #[test]
 fn backend_label_names_the_service_that_actually_runs_the_code() {
-    assert_eq!(backend_label(Language::Rust), "Rust Playground");
+    // 7 言語とも同じ基盤 (自前イメージの Vercel Sandbox) で動く (ADR 0003)
     for lang in Language::ALL {
-        if lang != Language::Rust {
-            assert_eq!(backend_label(lang), "Wandbox");
-        }
+        assert_eq!(backend_label(lang), "Vercel Sandbox", "{}", lang.slug());
     }
 }
 
@@ -94,11 +92,12 @@ fn console_wording_is_not_hardcoded_to_rust() {
     // 実行中の文言は選択中の言語に追従すること
     let py = console_running_hint(Language::Python);
     assert!(py.contains("Python"), "{py}");
-    assert!(py.contains("Wandbox"), "{py}");
+    assert!(py.contains("Sandbox"), "{py}");
     assert!(!py.contains("Rust"), "{py}");
 
     let rs = console_running_hint(Language::Rust);
-    assert!(rs.contains("Rust Playground"), "{rs}");
+    assert!(rs.contains("Rust"), "{rs}");
+    assert!(rs.contains("Sandbox"), "{rs}");
 }
 
 #[test]

@@ -1,6 +1,6 @@
 //! 問題コンテンツの品質検証ハーネス。
 //!
-//! 上流の実行サービス (Playground / Wandbox) に負荷をかけず、ローカルで
+//! 上流に負荷をかけず、ローカルで
 //! `answer_code` / `starter_code` を実際にコンパイル・実行して「収録して良い問題か」を
 //! 機械判定する。Rust はローカル cargo、他 6 言語は版を固定した Docker イメージ
 //! (ADR 0002 の表が正本)。
@@ -10,10 +10,9 @@ pub mod docker;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use shared::language::Language;
-use shared::playground::{TEST_FAILED_MARKER, TEST_OK_MARKER};
+use shared::contract::{TEST_FAILED_MARKER, TEST_OK_MARKER};
 use shared::problem::{compose_submission, Level, Problem};
 
 use crate::docker::{plan_batch, CaseKind, RunCase};
@@ -359,36 +358,3 @@ pub fn run_batch_docker(
     Ok(report)
 }
 
-/// Rust は Docker を使わずローカル cargo で 1 問ずつ検証する (この方が速い)。
-pub fn run_problem_rust(scratch_dir: &Path, code: &str, hidden_tests: &str) -> std::io::Result<CaseOutcome> {
-    let src_dir = scratch_dir.join("src");
-    fs::create_dir_all(&src_dir)?;
-    let manifest = scratch_dir.join("Cargo.toml");
-    if !manifest.exists() {
-        fs::write(
-            &manifest,
-            // 空の [workspace] で親 workspace への取り込みを防ぐ
-            "[package]\nname = \"knock-scratch\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[lib]\npath = \"src/lib.rs\"\n\n[workspace]\n",
-        )?;
-    }
-    fs::write(
-        src_dir.join("lib.rs"),
-        compose_submission(Language::Rust, code, hidden_tests),
-    )?;
-
-    let out = Command::new("timeout")
-        .arg(docker::CASE_TIMEOUT_SECS.to_string())
-        .arg("cargo")
-        .args(["test", "--quiet"])
-        .current_dir(scratch_dir)
-        .env("CARGO_TERM_COLOR", "never")
-        .output()?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    Ok(CaseOutcome {
-        problem_id: String::new(),
-        kind: CaseKind::Answer,
-        passed: case_passed(out.status.code().unwrap_or(-1), &stdout),
-        output: format!("{stdout}{stderr}"),
-    })
-}

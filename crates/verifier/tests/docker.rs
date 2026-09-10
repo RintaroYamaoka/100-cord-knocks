@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use shared::language::Language;
+use shared::runner::LOCAL_IMAGE;
 use verifier::docker::{container_script, plan_batch, CaseKind, RunCase};
 
 fn cases(n: usize) -> Vec<RunCase> {
@@ -17,9 +18,9 @@ fn cases(n: usize) -> Vec<RunCase> {
 
 #[test]
 fn a_whole_batch_needs_exactly_one_container() {
-    // 1 問ごとにコンテナを起こすと 1800 問 × 2 で起動オーバーヘッドだけで数時間かかる。
+    // 1 問ごとにコンテナを起こすと 2100 問 × 2 で起動オーバーヘッドだけで数時間かかる。
     // バッチ 1 ファイル = コンテナ 1 回であることをここで固定する。
-    for lang in Language::ALL.into_iter().filter(|l| *l != Language::Rust) {
+    for lang in Language::ALL {
         let plan = plan_batch(lang, &cases(20), Path::new("/tmp/w"));
         assert_eq!(plan.len(), 1, "{} が {} 回コンテナを起こしている", lang.slug(), plan.len());
     }
@@ -33,9 +34,13 @@ fn container_count_does_not_grow_with_problem_count() {
 }
 
 #[test]
-fn rust_is_planned_locally_not_in_docker() {
-    // Rust はローカル cargo が速いので Docker に載せない (ADR 0002)
-    assert!(plan_batch(Language::Rust, &cases(20), Path::new("/tmp/w")).is_empty());
+fn rust_is_verified_in_the_same_image_as_everything_else() {
+    // 以前は Rust だけローカル cargo で検証していた (速いので)。本番が 7 言語とも
+    // 同じイメージになったので、検証も同じイメージに寄せる。ホストの rustc と
+    // イメージの rustc が違うと、Rust だけ「検証と本番の版がずれる」状態に戻る
+    let plan = plan_batch(Language::Rust, &cases(20), Path::new("/tmp/w"));
+    assert_eq!(plan.len(), 1, "Rust が Docker で検証されていない");
+    assert_eq!(plan[0].image, LOCAL_IMAGE);
 }
 
 #[test]
@@ -44,25 +49,27 @@ fn empty_batch_plans_no_container() {
 }
 
 #[test]
-fn plan_uses_the_pinned_image_for_the_language() {
-    let plan = plan_batch(Language::Java, &cases(3), Path::new("/tmp/w"));
-    assert_eq!(plan[0].image, "eclipse-temurin:22-jdk");
-    let plan = plan_batch(Language::Csharp, &cases(3), Path::new("/tmp/w"));
-    assert_eq!(plan[0].image, "mcr.microsoft.com/dotnet/sdk:6.0");
+fn every_language_uses_the_one_unified_image() {
+    // 「検証と本番が同じイメージ」が ADR 0003 の核心。言語ごとに別イメージへ
+    // 戻すと、TS の target ずれのような「verifier は緑なのに本番は落ちる」差が復活する
+    for lang in Language::ALL {
+        let plan = plan_batch(lang, &cases(3), Path::new("/tmp/w"));
+        assert_eq!(plan[0].image, LOCAL_IMAGE, "{} が別イメージを使っている", lang.slug());
+    }
 }
 
 #[test]
 fn plan_is_network_isolated() {
     // 提出コードは信頼できない。ネットワークを与えない
+    // (本番の Sandbox 側も networkPolicy: deny-all で同じ条件にしてある)
     let plan = plan_batch(Language::Python, &cases(3), Path::new("/tmp/w"));
     assert!(plan[0].network_disabled, "コンテナにネットワークが残っている");
 }
 
 #[test]
 fn every_case_gets_a_per_case_timeout() {
-    // 無限ループを書いた 1 問がバッチ全体を永久にブロックしないこと。
-    // これは wall-clock しか焼かないので、再試行上限もトークン上限も発火しない
-    for lang in Language::ALL.into_iter().filter(|l| *l != Language::Rust) {
+    // 無限ループを書いた 1 問がバッチ全体を永久にブロックしないこと
+    for lang in Language::ALL {
         let script = container_script(lang, &cases(2));
         assert!(script.contains("timeout "), "{} のスクリプトに timeout が無い", lang.slug());
     }
@@ -88,15 +95,46 @@ fn script_records_exit_code_and_streams_separately() {
 }
 
 #[test]
-fn csharp_script_creates_the_project_once_outside_the_loop() {
-    // dotnet new をケースごとに走らせると 40 回 × 3 秒でバッチが崩壊する
-    let script = container_script(Language::Csharp, &cases(20));
-    assert_eq!(script.matches("dotnet new console").count(), 1, "{script}");
+fn script_commands_come_from_the_shared_run_plan() {
+    // コマンドの定義を verifier 側に持つと、本番 (shared::runner) との二重管理になる。
+    // 2026-08-29 の TS target ずれはまさにこれで起きた
+    for lang in Language::ALL {
+        let plan = shared::runner::run_plan(lang);
+        let script = container_script(lang, &cases(1));
+        assert!(
+            script.contains(&plan.run),
+            "{}: run ({}) がスクリプトに入っていない",
+            lang.slug(),
+            plan.run
+        );
+        if let Some(compile) = plan.compile {
+            assert!(script.contains(&compile), "{}: compile が違う", lang.slug());
+        }
+    }
+}
+
+#[test]
+fn csharp_and_rust_copy_the_baked_template_per_case() {
+    // ひな形 (restore 済み / cargo プロジェクト) はイメージに焼いてある。
+    // ケースごとにコピーするので、ケース間で状態が混ざらない
+    for lang in [Language::Csharp, Language::Rust] {
+        let script = container_script(lang, &cases(2));
+        assert!(
+            script.contains(shared::runner::TEMPLATE_ROOT),
+            "{}: ひな形を使っていない",
+            lang.slug()
+        );
+    }
+    // dotnet new はイメージのビルド時に済んでいる。実行時に走らせてはいけない
+    assert!(!container_script(Language::Csharp, &cases(20)).contains("dotnet new"));
 }
 
 #[test]
 fn scripts_use_the_language_source_file_name() {
-    for lang in Language::ALL.into_iter().filter(|l| *l != Language::Rust) {
+    // C# だけ例外: csproj がディレクトリの **/*.cs を拾うので、コマンドは
+    // ファイル名を書かない (ファイルは verifier 側が source_file_name() で置く)。
+    // 逆に名前を書くと、ひな形の Program.cs と二重管理になる
+    for lang in Language::ALL.into_iter().filter(|l| *l != Language::Csharp) {
         let script = container_script(lang, &cases(1));
         assert!(
             script.contains(lang.source_file_name()),

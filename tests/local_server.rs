@@ -129,9 +129,9 @@ fn rejects_malformed_execute_request() {
 }
 
 #[test]
-#[ignore = "実上流 (Wandbox) に接続する"]
+#[ignore = "実上流 (Vercel Sandbox) に接続する"]
 fn typescript_flags_reach_the_upstream_through_the_server() {
-    // 回帰テスト: ハーネスが `compiler-option-raw` を送っていなかったせいで、
+    // 回帰テスト: ハーネスが tsc の target を渡していなかったせいで、
     // ES2019+ の API を使う正解が「ブラウザ検証だけ落ちる」ことがあった。
     // Object.fromEntries は --target es2020 が無いと TS2550 になる。
     if !dist_ready() {
@@ -151,15 +151,15 @@ fn typescript_flags_reach_the_upstream_through_the_server() {
         .send()
         .unwrap();
     assert_eq!(r.status(), 200, "HTTP {}", r.status());
-    let body: shared::playground::ExecuteResponse = r.json().unwrap();
+    let body: shared::contract::ExecuteResponse = r.json().unwrap();
     assert!(
         !body.compile_failed,
         "ES2020 のフラグが上流に届いていない: {}",
         body.stderr
     );
     assert_eq!(
-        shared::playground::classify(&body),
-        shared::playground::Outcome::Passed,
+        shared::contract::classify(&body),
+        shared::contract::Outcome::Passed,
         "stdout={:?} stderr={:?}",
         body.stdout,
         body.stderr

@@ -18,7 +18,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use shared::playground::ExecuteRequest;
+use shared::contract::ExecuteRequest;
 use tokio::net::TcpListener;
 
 // 本番のプロキシをそのまま取り込む。main/handler は Vercel 用なのでここでは使わない

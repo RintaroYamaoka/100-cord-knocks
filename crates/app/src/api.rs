@@ -1,7 +1,7 @@
 //! バックエンド /api/execute と問題データ (静的 JSON) への通信層。
 
 use shared::language::Language;
-use shared::playground::{ExecuteRequest, ExecuteResponse};
+use shared::contract::{ExecuteRequest, ExecuteResponse};
 use shared::problem::{Level, Problem};
 
 /// エラー応答ボディ ({"error": "..."}) から利用者向けメッセージを取り出す。

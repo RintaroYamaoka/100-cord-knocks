@@ -1,10 +1,10 @@
 //! 実行結果コンソール。コンパイラ / ランタイムの出力を行種別で色分けする。
-//! 行の分類は言語共通 (shared::playground::classify_line)、エラーコードのリンクは
+//! 行の分類は言語共通 (shared::contract::classify_line)、エラーコードのリンクは
 //! 公式のコード別ページがある Rust だけ。
 
 use leptos::prelude::*;
 use shared::language::Language;
-use shared::playground::{classify_line, ExecuteResponse, LineKind, Outcome};
+use shared::contract::{classify_line, ExecuteResponse, LineKind, Outcome};
 
 use crate::lang::{console_idle_hint, console_running_hint, links_error_codes};
 

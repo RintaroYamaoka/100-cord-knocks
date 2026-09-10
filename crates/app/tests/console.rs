@@ -1,5 +1,5 @@
 use app::console::{outcome_banner_parts, outcome_note, split_error_codes, ConsoleSegment};
-use shared::playground::Outcome;
+use shared::contract::Outcome;
 
 #[test]
 fn splits_line_around_error_codes() {
