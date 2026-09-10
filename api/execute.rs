@@ -76,6 +76,7 @@ const QUOTA_EXHAUSTED: &str =
     "Vercel Sandbox の今月の無料枠を使い切りました。枠がリセットされるまで実行できません (コードの問題ではありません)";
 
 /// 上流 (Vercel Sandbox API) 呼び出しの失敗。HTTP の殻に変換する前の形。
+#[derive(Debug)]
 enum SandboxError {
     NoCredentials,
     BadCredentials,
@@ -142,7 +143,11 @@ pub async fn dispatch(
     if let Err(msg) = validate(&exec_req) {
         return json_error(StatusCode::BAD_REQUEST, &msg);
     }
-    match run_in_sandbox(exec_req.language, &exec_req.code, header_token).await {
+    let upstream = match Upstream::new(header_token) {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+    match run_in_sandbox(exec_req.language, &exec_req.code, &upstream).await {
         Ok(resp) => ok(&resp),
         Err(e) => e.into_response(),
     }
@@ -181,30 +186,102 @@ fn random_hex() -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 上流への HTTP クライアント。**プロセスで 1 個だけ作って使い回す。**
+///
+/// 毎回 `Client::builder()` から作ると接続プールも作り直しになり、提出のたびに
+/// api.vercel.com への TCP + TLS 握手が要る。Fluid Compute は関数インスタンスを
+/// 跨いで再利用するので、静的に持てば 2 回目以降の提出は温まった接続に乗る。
 fn client() -> Result<reqwest::Client, SandboxError> {
-    reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|_| SandboxError::Failed)
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| reqwest::Client::builder().timeout(HTTP_TIMEOUT).build().ok())
+        .clone()
+        .ok_or(SandboxError::Failed)
+}
+
+/// 上流 (Vercel Sandbox API) への接続一式。
+///
+/// ベース URL を値で持つのは、**偽の上流を立てて挙動を検証できるようにするため**
+/// (下の `mod stop_is_not_awaited`)。本番は常に `SANDBOX_API`。
+#[derive(Clone)]
+struct Upstream {
+    base: String,
+    client: reqwest::Client,
+    token: String,
+}
+
+impl Upstream {
+    fn new(header_token: Option<&str>) -> Result<Self, SandboxError> {
+        Ok(Self {
+            base: SANDBOX_API.to_string(),
+            client: client()?,
+            token: token(header_token).ok_or(SandboxError::NoCredentials)?,
+        })
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base)
+    }
+}
+
+/// 応答を返した後も走り続けている停止要求の数。
+///
+/// 停止を待たなくなった (L1) ので、**「投げたが届いていない」区間が存在する**。
+/// 本番ではそれで構わない (サンドボックスは `timeout` で必ず消える) が、
+/// 検証では「確かに届いた」ことを確かめたいので、数だけ数えておく。
+mod pending_stops {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn begin() {
+        IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn end() {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub fn in_flight() -> usize {
+        IN_FLIGHT.load(Ordering::SeqCst)
+    }
+
+    /// 走り続けている停止要求が捌けるまで待つ。**検証専用。**
+    /// 捌けたら true。上限まで待っても残っていたら false (呼び出し側が失敗にできる)。
+    #[allow(dead_code)]
+    pub async fn drain(limit: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while in_flight() > 0 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        true
+    }
 }
 
 async fn run_in_sandbox(
     language: Language,
     code: &str,
-    header_token: Option<&str>,
+    up: &Upstream,
 ) -> Result<ExecuteResponse, SandboxError> {
-    let token = token(header_token).ok_or(SandboxError::NoCredentials)?;
-    let client = client()?;
-
     let nonce = Nonce::new(&random_hex());
     let script = build_script(language, &base64_encode(code.as_bytes()), &nonce);
 
-    let session = create_session(&client, &token).await?;
-    let result = exec_script(&client, &token, &session, &script).await;
+    let session = create_session(up).await?;
+    let result = exec_script(up, &session, &script).await;
 
-    // 停止は best effort。止め忘れてもサンドボックスの timeout で落ちるが、
-    // 待つぶんだけ課金対象のメモリ時間が伸びるので必ず投げる。
-    stop_session(&client, &token, &session).await;
+    // **停止を待たない。** 実測で 1.6〜2.7 秒あり、提出 1 回の体感時間の 3〜4 割を
+    // 占めていた。結果の詰め替えに停止は要らないので、投げるだけ投げて先へ進む。
+    //
+    // 待たなくて安全な理由:
+    //   - 停止は元から best effort (失敗しても利用者の結果には影響させない)
+    //   - サンドボックスは `SANDBOX_TIMEOUT_MS` で必ず消える。届かなくても残骸は残らない
+    //   - `persistent: false` なので停止時のスナップショットも作られない
+    //   - 課金は provisioned memory の 1 分最低課金なので、数十秒早く止めても変わらない
+    // Fluid Compute は応答後も関数インスタンスを生かすので、実際はほぼ届く。
+    spawn_stop(up.clone(), session);
 
     let result = result?;
     match parse_runner_output(&nonce, &result.stdout) {
@@ -221,18 +298,16 @@ async fn run_in_sandbox(
     }
 }
 
-async fn create_session(
-    client: &reqwest::Client,
-    token: &str,
-) -> Result<String, SandboxError> {
+async fn create_session(up: &Upstream) -> Result<String, SandboxError> {
     // projectId は送らない: OIDC トークンがプロジェクトに紐づいているため上流が解決する
     // (実測 2026-09-11)。本番の関数環境にプロジェクト ID は渡ってこない。
     let payload = CreateSandboxRequest::for_submission(&image());
 
     for attempt in 0..=CREATE_RETRIES {
-        let resp = match client
-            .post(format!("{SANDBOX_API}/v4/sandboxes"))
-            .bearer_auth(token)
+        let resp = match up
+            .client
+            .post(up.url("/v4/sandboxes"))
+            .bearer_auth(&up.token)
             .json(&payload)
             .send()
             .await
@@ -266,16 +341,16 @@ async fn create_session(
 }
 
 async fn exec_script(
-    client: &reqwest::Client,
-    token: &str,
+    up: &Upstream,
     session: &str,
     script: &str,
 ) -> Result<shared::sandbox::CommandResult, SandboxError> {
     // cmdId はクエリ引数で、呼び出し側が採番する
     let cmd_id = format!("c{}", random_hex());
-    let resp = match client
-        .post(format!("{SANDBOX_API}/v2/sandboxes/sessions/{session}/cmd?cmdId={cmd_id}"))
-        .bearer_auth(token)
+    let resp = match up
+        .client
+        .post(up.url(&format!("/v2/sandboxes/sessions/{session}/cmd?cmdId={cmd_id}")))
+        .bearer_auth(&up.token)
         .json(&ExecCommandRequest::shell_script(script))
         .send()
         .await
@@ -300,11 +375,23 @@ async fn exec_script(
     Ok(parse_command_stream(&body))
 }
 
-/// 停止。失敗しても利用者の結果には影響させない (サンドボックスは timeout で必ず消える)。
-async fn stop_session(client: &reqwest::Client, token: &str, session: &str) {
-    let _ = client
-        .post(format!("{SANDBOX_API}/v2/sandboxes/sessions/{session}/stop"))
-        .bearer_auth(token)
+/// 停止を投げて**待たずに戻る**。応答を返した後も走り続ける。
+///
+/// 失敗しても利用者の結果には影響させない (サンドボックスは timeout で必ず消える)。
+fn spawn_stop(up: Upstream, session: String) {
+    pending_stops::begin();
+    tokio::spawn(async move {
+        stop_session(&up, &session).await;
+        pending_stops::end();
+    });
+}
+
+/// 停止そのもの。Content-Type が無いと上流は 415 を返す (実測 2026-09-11)。
+async fn stop_session(up: &Upstream, session: &str) {
+    let _ = up
+        .client
+        .post(up.url(&format!("/v2/sandboxes/sessions/{session}/stop")))
+        .bearer_auth(&up.token)
         .header("content-type", "application/json")
         .body("{}")
         .send()
@@ -363,6 +450,136 @@ mod messages {
     }
 }
 
+// ---- 停止を待たないことの検証 (L1) ----
+//
+// 偽の上流を立てて「応答は停止の完了を待たない」ことを実測する。実上流に対しては
+// 停止が速いか遅いかを選べないので、ここだけ上流を差し替えられるようにしてある
+// (`Upstream::base`)。本番の経路は `run_in_sandbox` そのままを通る。
+#[cfg(test)]
+mod stop_is_not_awaited {
+    use super::*;
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use shared::contract::{classify, Outcome};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    /// 偽の上流が停止要求を握る時間。実測 (1.6〜2.7 秒) と同じ桁にしてある。
+    const STOP_DELAY: Duration = Duration::from_secs(2);
+
+    #[derive(Default)]
+    struct Fake {
+        stop_finished: AtomicBool,
+    }
+
+    fn json_body(body: String) -> hyper::Response<Full<Bytes>> {
+        hyper::Response::builder()
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap()
+    }
+
+    /// スクリプトから nonce を拾う (実行ごとに変わるので、偽の上流も本物と同じく
+    /// 受け取ったスクリプトから読むしかない)。
+    fn nonce_in(script: &str) -> String {
+        let start = script.find("KNOCKS").expect("スクリプトに区切りが無い");
+        script[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect()
+    }
+
+    async fn route(
+        fake: Arc<Fake>,
+        req: hyper::Request<hyper::body::Incoming>,
+    ) -> Result<hyper::Response<Full<Bytes>>, std::convert::Infallible> {
+        let path = req.uri().path().to_string();
+        let body = req.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+
+        if path == "/v4/sandboxes" {
+            return Ok(json_body(r#"{"session":{"id":"s1"}}"#.to_string()));
+        }
+        if path.ends_with("/cmd") {
+            // 本物のスクリプトが出すのと同じ形の stdout を組み立てて返す
+            let n = nonce_in(&String::from_utf8_lossy(&body));
+            let mut out = String::new();
+            for (section, value) in
+                [("cout", ""), ("cerr", ""), ("pout", "test result: ok\n"), ("perr", ""), ("exit", "0\n")]
+            {
+                out.push_str(&format!("\n{n}:{section}\n{value}"));
+            }
+            out.push_str(&format!("\n{n}:end\n"));
+            let stream = serde_json::json!({ "stream": "stdout", "data": out }).to_string();
+            let done = serde_json::json!({ "command": { "exitCode": 0 } }).to_string();
+            return Ok(json_body(format!("{stream}\n{done}\n")));
+        }
+        if path.ends_with("/stop") {
+            tokio::time::sleep(STOP_DELAY).await;
+            fake.stop_finished.store(true, Ordering::SeqCst);
+            return Ok(json_body("{}".to_string()));
+        }
+        Ok(json_body("{}".to_string()))
+    }
+
+    async fn fake_upstream(fake: Arc<Fake>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind できない");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let fake = fake.clone();
+                tokio::spawn(async move {
+                    let _ = http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(move |req| route(fake.clone(), req)),
+                        )
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn the_response_does_not_wait_for_the_sandbox_to_stop() {
+        let fake = Arc::new(Fake::default());
+        let up = Upstream {
+            base: fake_upstream(fake.clone()).await,
+            client: client().expect("クライアントが作れない"),
+            token: "test-token".to_string(),
+        };
+
+        let started = std::time::Instant::now();
+        let resp = run_in_sandbox(Language::Python, "def add(a, b):\n    return a + b\n", &up)
+            .await
+            .expect("実行に失敗");
+        let elapsed = started.elapsed();
+
+        // 結果は普段どおり返る
+        assert_eq!(classify(&resp), Outcome::Passed, "{resp:?}");
+        // 停止 (2 秒) を待っていない
+        assert!(elapsed < STOP_DELAY / 2, "停止の完了を待っている: {elapsed:?}");
+        assert!(!fake.stop_finished.load(Ordering::SeqCst), "応答時点で停止が完了している");
+
+        // 待たないだけで、投げっぱなしにはしない: 応答の後に確かに届く
+        assert!(pending_stops::drain(STOP_DELAY * 3).await, "停止要求が捌けなかった");
+        assert!(fake.stop_finished.load(Ordering::SeqCst), "停止が上流に届いていない");
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_outlives_a_lost_stop_by_at_most_its_own_timeout() {
+        // 停止が届かなくても残骸が残らない根拠 = サンドボックス自身の timeout。
+        // コマンドの上限より長く、かつ「忘れられても数分で消える」範囲に収まっていること。
+        let t = shared::sandbox::SANDBOX_TIMEOUT_MS;
+        assert!(t > shared::sandbox::COMMAND_TIMEOUT_MS, "コマンドより先にサンドボックスが死ぬ");
+        assert!(t <= 5 * 60 * 1000, "停止が届かないと {t}ms 生き残る (長すぎる)");
+    }
+}
+
 // ---- 実上流に対する疎通テスト ----
 //
 // 既定では走らせない (ネットワークと Vercel の認証に依存するため)。
@@ -379,6 +596,13 @@ mod upstream_tests {
     use shared::fixtures;
     use shared::contract::{classify, Outcome};
     use shared::problem::compose_submission;
+
+    /// テストのランタイムが終わると、まだ届いていない停止要求は捨てられる。
+    /// 実サンドボックスを置き去りにしない (Hobby は同時 10 が上限) ために、
+    /// 各テストの最後で捌けるまで待つ。**本番はここを待たない** (それが L1)。
+    async fn stop_all() {
+        assert!(pending_stops::drain(Duration::from_secs(15)).await, "停止要求が残った");
+    }
 
     async fn run(lang: Language, user_code: &str) -> (StatusCode, ExecuteResponse) {
         let code = compose_submission(lang, user_code, fixtures::for_language(lang).hidden_tests);
@@ -411,6 +635,7 @@ mod upstream_tests {
             );
             println!("✓ {:<11} 正解 → Passed ({:.2}s)", lang.slug(), started.elapsed().as_secs_f64());
         }
+        stop_all().await;
     }
 
     #[tokio::test]
@@ -423,6 +648,7 @@ mod upstream_tests {
             assert_ne!(o, Outcome::Passed, "{}: 未実装が正解になった", lang.slug());
             println!("✓ {:<11} 未実装 → {o:?}", lang.slug());
         }
+        stop_all().await;
     }
 
     #[tokio::test]
@@ -439,6 +665,7 @@ mod upstream_tests {
             let first = r.stderr.lines().find(|l| l.contains(sig)).unwrap_or("");
             println!("✓ {:<11} 壊れたコード → CompileError: {}", lang.slug(), first.trim());
         }
+        stop_all().await;
     }
 
     #[tokio::test]
@@ -449,6 +676,7 @@ mod upstream_tests {
             assert!(!r.stderr.contains(noise), "ビルドノイズが残っている ({noise}): {:?}", r.stderr);
         }
         println!("✓ C# のビルドノイズは除去されている (stderr={:?})", r.stderr);
+        stop_all().await;
     }
 
     #[tokio::test]
@@ -458,5 +686,6 @@ mod upstream_tests {
         let (_, r) = run(Language::Python, "import sys\ndef add(a, b):\n    return 0\nsys.exit(0)").await;
         assert_eq!(classify(&r), Outcome::NoTestsRun, "stdout={:?}", r.stdout);
         println!("✓ 先に exit(0) する提出 → NoTestsRun");
+        stop_all().await;
     }
 }
