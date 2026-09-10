@@ -14,7 +14,7 @@
   - ここで組むスクリプトは `shared::runner::build_script` の写しであって正本ではない。
     判定まで含めて確かめたいときは `cargo test -p rust-100-knocks-api -- --ignored` を使う
 """
-import base64, json, os, time, urllib.request, uuid
+import base64, json, os, sys, time, urllib.request, uuid
 
 API = "https://api.vercel.com"
 TOKEN = None
@@ -23,6 +23,9 @@ for line in open(".env.local"):
         TOKEN = line.split("=", 1)[1].strip().strip('"')
 IMAGE = "knocks-runtime:2026-09-11"
 T = 20
+# vCPU 数 (1 vCPU = メモリ 2GB)。第 1 引数で変えられる: コンパイルが並列化で速くなるか、
+# それとも周辺コストに埋もれるかを実測で決めるため
+VCPUS = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
 def req(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
@@ -62,10 +65,11 @@ def run_cmd(sid, s):
     ok = "test result: ok" in out
     return el, ok
 
+print(f"vcpus={VCPUS}")
 print(f"{'言語':<12} {'作成':>6} {'1回目':>7} {'2回目':>7} {'3回目':>7} {'停止':>6}  {'毎回作り直し':>12} {'再利用':>8}")
 for lang in PLANS:
     t = time.time()
-    sid = json.loads(req("POST", "/v4/sandboxes", {"image": IMAGE, "resources": {"vcpus": 1},
+    sid = json.loads(req("POST", "/v4/sandboxes", {"image": IMAGE, "resources": {"vcpus": VCPUS},
          "timeout": 180000, "persistent": False, "networkPolicy": {"mode": "deny-all"}}))["session"]["id"]
     create = time.time() - t
     runs = []
