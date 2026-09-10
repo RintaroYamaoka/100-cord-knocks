@@ -3,7 +3,7 @@
 7 言語の実行を Vercel Sandbox の自前イメージに統一する変更の動作テスト。
 OPEN が 1 行でも残っている間は統合しない。
 
-最終更新: 2026-09-11
+最終更新: 2026-09-11 (全行 CLOSED。本番デプロイと 2100 問の再検証まで完了)
 
 ## 継ぎ目 (どこを跨いだか)
 
@@ -28,15 +28,28 @@ OPEN が 1 行でも残っている間は統合しない。
 | V8 | **提出コードが判定を偽装できない** (held-out oracle) | **CLOSED** | ① 区切りは実行ごとの nonce (getrandom) ② パーサは後勝ちで読む (`forged_sections_inside_program_output_do_not_win`) ③ コードは base64 で埋め、シェルに展開しない (`submitted_code_is_never_interpolated_into_the_shell`) |
 | V9 | 本番と検証でコマンド定義が 1 箇所 | **CLOSED** | `script_commands_come_from_the_shared_run_plan` (7 言語で verifier のスクリプトが `shared::runner::run_plan` の文字列を含む)。verifier 側の言語別コマンドは削除済み |
 | V10 | C# の診断が読める形 (一時パスと csproj 接尾辞が無い) | **CLOSED** | 実測で `prog.cs(2,67): error CS0029: Cannot implicitly convert type 'int' to 'string'`。`-p:GenerateFullPaths=false` + `strip_msbuild_project_suffix`。`csharp_response_carries_no_build_noise` が `.csproj]` も検査 |
-| V11 | 全 2100 問で answer 通過 / starter 失敗 (新イメージ) | **OPEN (実行中)** | C# 初級 100 問は実測で「検証 100 問 / 問題あり 0 件 / コンテナ起動 1 回」。全 2100 問は `cargo run -p verifier -- --expect 2100` を実行中 |
+| V11 | 全 2100 問で answer 通過 / starter 失敗 (新イメージ) | **CLOSED** | `cargo run -p verifier -- --expect 2100` → **「検証 2100 問 / 問題あり 0 件 / コンテナ起動 21 回」**、終了コード 0。問題コンテンツは 1 文字も変えずに実行基盤を差し替えて全問通過 |
 | V12 | Wandbox / Playground への依存がコードから消えている | **CLOSED** | `grep -rn 'wandbox\|play.rust-lang' --include='*.rs'` が 0 件 (コメントの経緯説明のみ)。`Backend` enum、応答型、詰め替え関数を削除 |
-| V13 | 本番デプロイで 7 言語が実行できる (OIDC が Rust 関数に入る) | **OPEN (デプロイ前)** | ローカルからは実 Sandbox で 7/7 通過 (V5)。**本番の Rust 関数に `VERCEL_OIDC_TOKEN` が入るかは未実測** — 入らない場合は個人 PAT を Vercel の環境変数に置くフォールバックがある (`KNOCKS_VERCEL_TOKEN`) |
+| V13 | 本番デプロイで 7 言語が実行できる (OIDC が Rust 関数に届く) | **CLOSED (1 回失敗 → 修正後 7/7)** | 初回デプロイは全言語 500「認証情報がありません」。原因は **OIDC トークンが env ではなくリクエストヘッダ `x-vercel-oidc-token` で来る**こと (`docs/bootstrap/incidents/2026-09-11-oidc-token-is-a-header-not-an-env-var.md`)。ヘッダ優先で読むよう修正し再デプロイ → 下記「本番の実測」で 7/7 |
 | V14 | 枠切れ・一時障害の文言が「コードの問題ではない」と伝える | **CLOSED (一部は実測不能)** | 分類は `classify_sandbox_failure` の 6 件のテストで固定。**枠切れの実応答は枠を使い切るまで観測できない**ため、402 と `quota` / `resource_limit` / `exceeded your` の語で判定し、外れたら一般エラーに落ちる (黙って再試行はしない) |
 | V15 | フロントの文言が実行基盤と一致 | **CLOSED** | `backend_label` は 7 言語とも "Vercel Sandbox"。`crates/app/tests/lang.rs` 2 件 |
 
 ## 本番の実測 (V13)
 
-デプロイ後に記入する。
+2026-09-11、本番 `POST https://100-cord-knocks.vercel.app/api/execute` に投入した結果。
+正解コードと「わざと壊したコード」を各言語 1 本ずつ (スクリプトは session の scratchpad)。
+
+| 言語 | 正解 | 壊したコード (実診断) | 秒 (正解/壊れ) |
+|---|---|---|---|
+| rust | ✓ Passed | `error[E0308]: mismatched types` | 5.0 / 3.9 |
+| cpp | ✓ Passed | `prog.cc:1:33: error: invalid conversion from 'const char*' to 'int'` | 8.3 / 3.7 |
+| csharp | ✓ Passed | `prog.cs(2,67): error CS0029: Cannot implicitly convert type 'int' to 'string'` | 7.3 / 6.5 |
+| java | ✓ Passed | `prog.java:1: error: incompatible types: int cannot be converted to String` | 4.2 / 4.5 |
+| python | ✓ Passed | `SyntaxError: expected ':'` | 5.5 / 7.8 |
+| typescript | ✓ Passed | `prog.ts(1,52): error TS2322: Type 'number' is not assignable to type 'string'` | 6.1 / 6.0 |
+| javascript | ✓ Passed | `SyntaxError: Unexpected token ';'` | 4.9 / 5.7 |
+
+レイテンシは **4〜8 秒** (Wandbox / Playground 時代は 2〜5 秒)。
 
 ## 残る穴 (正直な記録)
 
