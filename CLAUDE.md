@@ -34,6 +34,10 @@ Vercel にデプロイ(静的 WASM フロント + Rust Functions)。
 cargo test --workspace --exclude app   # 契約層・プロキシ・verifier
 cargo test -p app                      # フロントの純ロジック (host でコンパイルできる範囲)
 
+# デプロイ済みの本番を実測する (7 言語の判定 + 提出 1 回の秒数)。
+# レイテンシを比べるときはデプロイの前後で複数回まわす (1 回では言えないほど散る)
+cargo test -p rust-100-knocks-api --test production -- --ignored --nocapture
+
 # 実行イメージ (7 言語のツールチェーン)。verifier と本番で同じものを使う
 bash scripts/build-runner-image.sh                  # ローカルに knocks-runtime:local
 bash scripts/build-runner-image.sh --push 2026-09-11 # VCR へ push (★個人アカウント専用)
@@ -95,6 +99,10 @@ trunk serve            # :8080 でフロント (API は vercel dev へプロキ�
 - **Sandbox 作成に `persistent: false` を必ず付ける**。既定は true で、停止のたびに自動
   スナップショットが作られる。Hobby のスナップショット保存は**生涯 15GB** なので、
   4.5GB のイメージだと数回で枯れて作成が止まる
+- **サンドボックスの停止を `await` で待つ形に戻さない**。`api/execute.rs` は結果を受け取ったら
+  停止を投げるだけ投げて応答する (`spawn_stop`)。待つと提出 1 回に 1.6〜2.7 秒が戻る
+  (本番平均 6.9s → 4.8s の差がこれ)。届かなくてもサンドボックスは自身の `timeout` で消える。
+  検証は `stop_is_not_awaited` の 2 件 (ADR 0003 の追記)
 - **Hobby の枠が実行回数の上限**: 作成 5,000 回/月・Active CPU 5 時間/月・同時 10。
   超えると課金ではなく**次サイクルまで作成が停止**する。プロキシは専用の文言
   (「今月の無料枠を使い切りました」) で返す。使用量は Vercel の Usage で見る
