@@ -54,20 +54,31 @@ fn ok(resp: &ExecuteResponse) -> Result<Response<String>, Error> {
     json_response(StatusCode::OK, serde_json::to_string(resp)?)
 }
 
-const BUSY: &str = "実行環境が混雑しています。少し待ってから再試行してください";
-const UNREACHABLE: &str = "実行環境に接続できませんでした。しばらくして再試行してください";
+// 利用者に見える文言。**実行先 (Vercel Sandbox) を名乗り、利用者のコードの問題か
+// どうかを言い切る。** 2026-09-07 の Wandbox 障害では「実行サービスがエラーを返しました」
+// としか出ておらず、利用者が自分のコードを疑い続けた。名前の正本は
+// `shared::runner::BACKEND_LABEL` (フロントのコンソール表示と同じものを使う)。
+const BUSY: &str = "Vercel Sandbox が混雑しています。少し待ってから再試行してください";
+const UNREACHABLE: &str =
+    "Vercel Sandbox に接続できませんでした。しばらくして再試行してください (コードの問題ではありません)";
+/// これだけは**利用者のコード側の問題**なので、実行先の名前を出さない。
 const TIMED_OUT: &str = "実行がタイムアウトしました。無限ループがないか確認してください";
-const UNPARSEABLE: &str = "実行結果を解釈できませんでした";
-const UPSTREAM_FAILED: &str = "実行環境がエラーを返しました";
-const NO_CREDENTIALS: &str = "実行環境の認証情報がありません (サーバー設定の問題です)";
+const UNPARSEABLE: &str =
+    "Vercel Sandbox の応答を解釈できませんでした (コードの問題ではありません)";
+const UPSTREAM_FAILED: &str = "Vercel Sandbox がエラーを返しました (コードの問題ではありません)";
+const NO_CREDENTIALS: &str =
+    "Vercel Sandbox の認証情報がありません (サーバー設定の問題です。コードの問題ではありません)";
+/// トークンが無効 / 権限不足。利用者には直せないので、設定の問題だと言い切る。
+const BAD_CREDENTIALS: &str =
+    "Vercel Sandbox の認証が拒否されました (サーバー設定の問題です。コードの問題ではありません)";
 /// Hobby の無料枠を使い切ったとき。**再試行しても直らない**ので、そう言う。
-/// 2026-09-07 の教訓: 原因が利用者のコードでないなら、文言でそれを伝える。
 const QUOTA_EXHAUSTED: &str =
-    "実行環境の今月の無料枠を使い切りました。枠がリセットされるまで実行できません (コードの問題ではありません)";
+    "Vercel Sandbox の今月の無料枠を使い切りました。枠がリセットされるまで実行できません (コードの問題ではありません)";
 
 /// 上流 (Vercel Sandbox API) 呼び出しの失敗。HTTP の殻に変換する前の形。
 enum SandboxError {
     NoCredentials,
+    BadCredentials,
     Busy,
     Quota,
     Unreachable,
@@ -82,6 +93,9 @@ impl SandboxError {
         match self {
             SandboxError::NoCredentials => {
                 json_error(StatusCode::INTERNAL_SERVER_ERROR, NO_CREDENTIALS)
+            }
+            SandboxError::BadCredentials => {
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, BAD_CREDENTIALS)
             }
             SandboxError::Busy => json_error(StatusCode::SERVICE_UNAVAILABLE, BUSY),
             SandboxError::Quota => json_error(StatusCode::SERVICE_UNAVAILABLE, QUOTA_EXHAUSTED),
@@ -239,6 +253,7 @@ async fn create_session(
         let body = resp.text().await.unwrap_or_default();
         match classify_sandbox_failure(status, &body) {
             UpstreamFailure::QuotaExhausted => return Err(SandboxError::Quota),
+            UpstreamFailure::Unauthorized => return Err(SandboxError::BadCredentials),
             UpstreamFailure::Transient if attempt < CREATE_RETRIES => {
                 tokio::time::sleep(Duration::from_millis(600 * (attempt as u64 + 1))).await;
                 continue;
@@ -275,6 +290,7 @@ async fn exec_script(
         let body = resp.text().await.unwrap_or_default();
         return Err(match classify_sandbox_failure(status, &body) {
             UpstreamFailure::QuotaExhausted => SandboxError::Quota,
+            UpstreamFailure::Unauthorized => SandboxError::BadCredentials,
             UpstreamFailure::Transient => SandboxError::Busy,
             UpstreamFailure::Other => SandboxError::Failed,
         });
@@ -293,6 +309,58 @@ async fn stop_session(client: &reqwest::Client, token: &str, session: &str) {
         .body("{}")
         .send()
         .await;
+}
+
+// ---- 利用者に見える文言 ----
+//
+// 実行先を替えたら文言も替える。ここが曖昧語のままだと、上流障害のときに
+// 利用者が自分のコードを疑い続ける (2026-09-07 の Wandbox 障害の実例)。
+#[cfg(test)]
+mod messages {
+    use super::*;
+    use shared::runner::BACKEND_LABEL;
+
+    /// 上流側の不調を伝える文言 (= 利用者のコードの問題ではないもの)。
+    const UPSTREAM_MESSAGES: [&str; 5] =
+        [BUSY, UNREACHABLE, UNPARSEABLE, UPSTREAM_FAILED, QUOTA_EXHAUSTED];
+
+    /// 設定側の問題を伝える文言。
+    const CONFIG_MESSAGES: [&str; 2] = [NO_CREDENTIALS, BAD_CREDENTIALS];
+
+    #[test]
+    fn upstream_failures_name_the_backend() {
+        for m in UPSTREAM_MESSAGES {
+            assert!(m.contains(BACKEND_LABEL), "実行先を名乗っていない: {m}");
+        }
+        for m in CONFIG_MESSAGES {
+            assert!(m.contains(BACKEND_LABEL), "実行先を名乗っていない: {m}");
+            assert!(m.contains("サーバー設定の問題"), "設定の問題だと言っていない: {m}");
+        }
+    }
+
+    #[test]
+    fn upstream_failures_say_it_is_not_the_users_code() {
+        // 「混雑しています・待ってから再試行」は原因がこちら側だと分かるので除く
+        for m in [UNREACHABLE, UNPARSEABLE, UPSTREAM_FAILED, QUOTA_EXHAUSTED] {
+            assert!(m.contains("コードの問題ではありません"), "原因の所在を言っていない: {m}");
+        }
+    }
+
+    #[test]
+    fn a_user_side_failure_does_not_blame_the_backend() {
+        // タイムアウトは利用者のコード側 (無限ループ) の問題。実行先を出すと誤誘導になる
+        assert!(!TIMED_OUT.contains(BACKEND_LABEL), "{TIMED_OUT}");
+        assert!(TIMED_OUT.contains("無限ループ"));
+    }
+
+    #[test]
+    fn no_message_mentions_a_retired_backend() {
+        for m in UPSTREAM_MESSAGES.iter().chain(CONFIG_MESSAGES.iter()).chain([TIMED_OUT].iter()) {
+            for stale in ["Wandbox", "Playground", "実行サービス"] {
+                assert!(!m.contains(stale), "古い実行先が残っている ({stale}): {m}");
+            }
+        }
+    }
 }
 
 // ---- 実上流に対する疎通テスト ----

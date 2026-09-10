@@ -5,11 +5,20 @@ use shared::contract::{ExecuteRequest, ExecuteResponse};
 use shared::problem::{Level, Problem};
 
 /// エラー応答ボディ ({"error": "..."}) から利用者向けメッセージを取り出す。
+///
+/// プロキシが文言を持っているならそれをそのまま見せる (枠切れや上流障害のときに
+/// 「コードの問題ではない」と伝えているのはプロキシ側なので、上書きしてはいけない)。
+/// 読めなかったときだけ、実行先を名乗る既定文言に落とす。
 pub fn error_message_from_body(status: u16, body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
-        .unwrap_or_else(|| format!("実行サービスへの接続に失敗しました (HTTP {status})"))
+        .unwrap_or_else(|| {
+            format!(
+                "{} への接続に失敗しました (HTTP {status})",
+                shared::runner::BACKEND_LABEL
+            )
+        })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -53,13 +62,20 @@ pub async fn execute(req: &ExecuteRequest) -> Result<ExecuteResponse, String> {
         .map_err(|e| format!("リクエストを構築できませんでした: {e}"))?
         .send()
         .await
-        .map_err(|_| "実行サービスに接続できませんでした。ネットワークを確認してください".to_string())?;
+        .map_err(|_| {
+            format!(
+                "{} に接続できませんでした。ネットワークを確認してください",
+                shared::runner::BACKEND_LABEL
+            )
+        })?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !(200..300).contains(&status) {
         return Err(error_message_from_body(status, &text));
     }
-    serde_json::from_str(&text).map_err(|_| "実行サービスの応答を解釈できませんでした".to_string())
+    serde_json::from_str(&text).map_err(|_| {
+        format!("{} の応答を解釈できませんでした", shared::runner::BACKEND_LABEL)
+    })
 }
 
 // ---- host スタブ (テストビルド用。実行は wasm でのみ成立する) ----

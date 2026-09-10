@@ -77,10 +77,34 @@ fn error_code_links_are_rust_only() {
 
 #[test]
 fn backend_label_names_the_service_that_actually_runs_the_code() {
-    // 7 言語とも同じ基盤 (自前イメージの Vercel Sandbox) で動く (ADR 0003)
+    // 7 言語とも同じ基盤 (自前イメージの Vercel Sandbox) で動く (ADR 0003)。
+    // 名前の正本は shared::runner::BACKEND_LABEL (プロキシのエラー文言と同じものを使う)
     for lang in Language::ALL {
+        assert_eq!(backend_label(lang), shared::runner::BACKEND_LABEL, "{}", lang.slug());
         assert_eq!(backend_label(lang), "Vercel Sandbox", "{}", lang.slug());
     }
+}
+
+#[test]
+fn client_side_errors_name_the_backend_and_not_the_old_ones() {
+    // 実行先が変わったら利用者に見える文言も変える。
+    // 「実行サービス」のような曖昧語だと、利用者は自分のコードを疑い続ける
+    let msg = app::api::error_message_from_body(502, "not json");
+    assert!(msg.contains("Vercel Sandbox"), "実行先を名乗っていない — {msg}");
+    for stale in ["Wandbox", "Playground", "実行サービス"] {
+        assert!(!msg.contains(stale), "古い文言が残っている ({stale}) — {msg}");
+    }
+}
+
+#[test]
+fn error_body_from_the_proxy_is_shown_verbatim() {
+    // プロキシ側の文言 (枠切れ・上流障害) はそのまま見せる。上書きすると
+    // 「コードの問題ではない」という肝心の情報が消える
+    let msg = app::api::error_message_from_body(
+        503,
+        r#"{"error":"Vercel Sandbox の今月の無料枠を使い切りました"}"#,
+    );
+    assert_eq!(msg, "Vercel Sandbox の今月の無料枠を使い切りました");
 }
 
 #[test]

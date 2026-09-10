@@ -94,6 +94,23 @@ fn quota_exhaustion_is_its_own_failure() {
 }
 
 #[test]
+fn unauthorized_is_a_configuration_problem_not_a_generic_failure() {
+    // 401/403 はトークンが無効・権限不足 = サーバー設定の問題。一般エラーに混ぜると、
+    // 2026-09-11 の「OIDC を env から読んでいた」級の設定ミスが
+    // 「実行環境がエラーを返しました」に埋もれて切り分けに戻れない
+    assert_eq!(classify_sandbox_failure(401, "Unauthorized"), UpstreamFailure::Unauthorized);
+    assert_eq!(
+        classify_sandbox_failure(403, "{\"error\":{\"code\":\"forbidden\"}}"),
+        UpstreamFailure::Unauthorized
+    );
+    // 枠切れの 403 は枠切れのまま (そちらが先に判定される)
+    assert_eq!(
+        classify_sandbox_failure(403, "You have exceeded your Sandbox quota"),
+        UpstreamFailure::QuotaExhausted
+    );
+}
+
+#[test]
 fn client_errors_are_not_retried() {
     // 400 台 (枠切れ以外) は再試行しても直らない
     assert_eq!(classify_sandbox_failure(400, "{\"error\":\"bad request\"}"), UpstreamFailure::Other);

@@ -26,6 +26,15 @@ fn raw(n: &Nonce, cout: &str, cerr: &str, pout: &str, perr: &str, exit: &str) ->
 // ---- 実行計画 ----
 
 #[test]
+fn the_backend_has_one_display_name() {
+    // 利用者向けの文言で実行先を名乗るための唯一の名前。
+    // 2026-09-07 の教訓: 上流障害のとき「どこが落ちているか」を文言に入れるだけで、
+    // 問い合わせが「壊れた?」から「そこが落ちてる?」に変わる
+    use shared::runner::BACKEND_LABEL;
+    assert_eq!(BACKEND_LABEL, "Vercel Sandbox");
+}
+
+#[test]
 fn every_language_has_a_run_command() {
     for lang in Language::ALL {
         let plan = run_plan(lang);

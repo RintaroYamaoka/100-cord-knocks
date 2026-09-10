@@ -15,6 +15,13 @@ use crate::contract::{harness_ran, has_compile_error, strip_csharp_build_noise, 
 /// 1 ケースの実行上限 (秒)。無限ループを書いた提出でサンドボックスを占有させない。
 pub const CASE_TIMEOUT_SECS: u64 = 20;
 
+/// 実行先の表示名。**利用者に見える文言で実行先を名乗るための唯一の名前。**
+///
+/// 2026-09-07 の Wandbox 障害で学んだこと: 上流が落ちているとき、文言に実行先の名前と
+/// 影響範囲を入れるだけで、利用者は「自分のコードの問題か」を切り分けられる。
+/// プロキシのエラー文言 (`api/execute.rs`) とフロントのコンソール表示が同じ名前を使う。
+pub const BACKEND_LABEL: &str = "Vercel Sandbox";
+
 /// 本番 (Vercel Sandbox) が使うイメージ。VCR の `knocks-runtime` リポジトリのタグ。
 /// 更新したら `scripts/build-runner-image.sh --push <tag>` で上げてここを差し替える。
 /// 本番側は環境変数 `KNOCKS_SANDBOX_IMAGE` で上書きできる (切り戻し用)。

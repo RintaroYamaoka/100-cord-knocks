@@ -193,6 +193,9 @@ pub enum UpstreamFailure {
     /// Hobby の枠切れ。**再試行しても直らず、次の請求サイクルまで作成が止まる。**
     /// 一般エラーに混ぜると 2026-09-07 の Wandbox 障害と同じ「原因不明の 502」に戻るので分ける。
     QuotaExhausted,
+    /// トークンが無効 / 権限不足 (401 / 403)。**サーバー設定の問題**で、利用者には直せない。
+    /// 2026-09-11 に OIDC トークンの取り方を間違えた経験から、設定ミスは設定ミスと言う。
+    Unauthorized,
     /// それ以外 (リクエスト不正など)。再試行しない
     Other,
 }
@@ -215,6 +218,9 @@ pub fn classify_sandbox_failure(status: u16, body: &str) -> UpstreamFailure {
         || lower.contains("exceeded your")
     {
         return UpstreamFailure::QuotaExhausted;
+    }
+    if status == 401 || status == 403 {
+        return UpstreamFailure::Unauthorized;
     }
     if status == 429 || (500..600).contains(&status) {
         return UpstreamFailure::Transient;
