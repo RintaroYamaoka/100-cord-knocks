@@ -32,7 +32,8 @@ OPEN が 1 行でも残っている間は統合しない。
 | V12 | Wandbox / Playground への依存がコードから消えている | **CLOSED** | `grep -rn 'wandbox\|play.rust-lang' --include='*.rs'` が 0 件 (コメントの経緯説明のみ)。`Backend` enum、応答型、詰め替え関数を削除 |
 | V13 | 本番デプロイで 7 言語が実行できる (OIDC が Rust 関数に届く) | **CLOSED (1 回失敗 → 修正後 7/7)** | 初回デプロイは全言語 500「認証情報がありません」。原因は **OIDC トークンが env ではなくリクエストヘッダ `x-vercel-oidc-token` で来る**こと (`docs/bootstrap/incidents/2026-09-11-oidc-token-is-a-header-not-an-env-var.md`)。ヘッダ優先で読むよう修正し再デプロイ → 下記「本番の実測」で 7/7 |
 | V14 | 枠切れ・一時障害の文言が「コードの問題ではない」と伝える | **CLOSED (一部は実測不能)** | 分類は `classify_sandbox_failure` の 6 件のテストで固定。**枠切れの実応答は枠を使い切るまで観測できない**ため、402 と `quota` / `resource_limit` / `exceeded your` の語で判定し、外れたら一般エラーに落ちる (黙って再試行はしない) |
-| V15 | フロントの文言が実行基盤と一致 | **CLOSED** | `backend_label` は 7 言語とも "Vercel Sandbox"。`crates/app/tests/lang.rs` 2 件 |
+| V15 | フロントの文言が実行基盤と一致 | **CLOSED** | `backend_label` は 7 言語とも "Vercel Sandbox" (正本は `shared::runner::BACKEND_LABEL`)。`crates/app/tests/lang.rs` 4 件 |
+| V16 | 利用者に見えるエラー文言が実行先を名乗り、原因の所在を言う | **CLOSED** | `api/execute.rs` の `mod messages` 4 件 (実行先を名乗る / 「コードの問題ではありません」と言う / タイムアウトは実行先を責めない / 旧実行先の名前が残っていない)。実測: 無効トークン → 「認証が拒否されました (サーバー設定の問題です)」、トークン無し → 「認証情報がありません」、上流エラー → 「Vercel Sandbox がエラーを返しました (コードの問題ではありません)」。401/403 は `UpstreamFailure::Unauthorized` として一般エラーから分離 |
 
 ## 本番の実測 (V13)
 
