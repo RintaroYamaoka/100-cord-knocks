@@ -81,8 +81,11 @@ Wandbox と play.rust-lang.org への依存を削除し、**verifier も同じ�
 
 ### 悪い影響 / トレードオフ
 
-- **レイテンシが悪化した**。Wandbox / Playground は 2〜5s、Sandbox 経由は **4〜10s**
-  (サンドボックス作成 + コンパイル)。イメージがその region で初回のときは 25s 程度かかる実測あり
+- **レイテンシが悪化した**。Wandbox / Playground は 2〜5s、Sandbox 経由は **4.7〜7.1s**。
+  イメージがその region で初回のときは 25s 程度かかる実測あり。
+  内訳 (2026-09-11 実測、`scripts/measure-sandbox-latency.py`): **コンパイル + 実行自体は
+  0.7〜2.0s** しかなく、残りは サンドボックス作成 0.8s / 初回のウォームアップ 1〜2s /
+  **停止待ち 1.6〜2.7s**。つまり削れる余地は大きい (停止を待たない → 再利用の順)
 - **Hobby の枠が新しい上限になった**: 作成 5,000 回/月、Active CPU 5 時間/月、同時 10。
   超過しても課金はされないが**次サイクルまでサンドボックス作成が止まる**。
   その状態は専用の文言 (`QUOTA_EXHAUSTED`) で「コードの問題ではない」と伝える
@@ -95,8 +98,12 @@ Wandbox と play.rust-lang.org への依存を削除し、**verifier も同じ�
 - ツールチェーンの版を上げるときは **`cargo run -p verifier -- --expect 2100` を通してから**。
   イメージのタグは `shared::runner::PRODUCTION_IMAGE` が正本で、`scripts/build-runner-image.sh --push <tag>`
   で上げる。本番は環境変数 `KNOCKS_SANDBOX_IMAGE` で切り戻せる
-- Hobby の枠の消費は Vercel の Usage で見る。手狭になったら
-  **サンドボックスの再利用 (pooling)** が最初の最適化 (作成回数が枠の律速なので効果が大きい)
+- Hobby の枠の消費は Vercel の Usage で見る。
+- **レイテンシ改善は未着手の残課題**。安い順に ① 応答前に停止を待つのをやめる
+  (−1.6〜2.7s) ② サンドボックスの再利用 (0.7〜2.0s まで。作成枠の節約にもなる)
+  ③ イメージ縮小。**② は「1 提出 = 使い捨ての microVM」という隔離の根拠を変えるので、
+  実装前にこの ADR への追記か新しい ADR で決める**。出発点は
+  `docs/bootstrap/handoffs/2026-09-11-unify-sandbox-runtime.md`
 - イメージは**個人アカウント (`rintaroyamaoka-3890` / `rintaro-yamaokas-projects`) の
   プロジェクト `100-cord-knocks`** に属する。`scripts/build-runner-image.sh` は
   `vercel whoami` と `VERCEL_TOKEN` の不在を確認してから動く (会社スコープでの誤爆防止)
