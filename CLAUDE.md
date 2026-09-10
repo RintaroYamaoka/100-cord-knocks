@@ -107,6 +107,10 @@ trunk serve            # :8080 でフロント (API は vercel dev へプロキ�
 - **判定の偽装対策を弱めない**: 出力のセクション区切りは実行ごとの nonce (getrandom)、
   パーサは**後勝ち**で読む、提出コードは base64 で埋める。先勝ちに戻すと
   `<nonce>:exit\n0` を印字するだけで不正解が正解になる
+- **OIDC トークンは関数には「リクエストヘッダ」で来る**。`x-vercel-oidc-token` であって
+  環境変数ではない (env に入るのはビルド時と `vercel env pull` したローカルだけ)。
+  env だけ見ていたため、統一の初回デプロイが全言語 500「認証情報がありません」になった。
+  詳細: `docs/bootstrap/incidents/2026-09-11-oidc-token-is-a-header-not-an-env-var.md`
 - **Sandbox の認証は OIDC で、`projectId` は送らない**。トークンがプロジェクトに紐づくので
   上流が解決する (本番の関数環境にプロジェクト ID は渡ってこない)
 - 問題コンテンツの検証は必ず `verifier` (ローカル Docker) で行う。本番の Sandbox に

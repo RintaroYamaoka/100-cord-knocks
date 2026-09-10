@@ -20,8 +20,8 @@ use shared::runner::{
     base64_encode, build_script, normalize_runner, parse_runner_output, Nonce, PRODUCTION_IMAGE,
 };
 use shared::sandbox::{
-    classify_sandbox_failure, parse_command_stream, CreateSandboxRequest, CreateSandboxResponse,
-    ExecCommandRequest, UpstreamFailure,
+    classify_sandbox_failure, parse_command_stream, pick_token, CreateSandboxRequest,
+    CreateSandboxResponse, ExecCommandRequest, UpstreamFailure, OIDC_HEADER,
 };
 use vercel_runtime::{run, service_fn, Error, Request, Response};
 
@@ -98,6 +98,13 @@ pub async fn handler(req: Request) -> Result<Response<String>, Error> {
         return json_error(StatusCode::METHOD_NOT_ALLOWED, "POST のみ受け付けます");
     }
 
+    // 本番の認証情報はここにしか無い。body を消費する前に取り出す
+    let header_token = req
+        .headers()
+        .get(OIDC_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
     let body = match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "リクエストボディを読めませんでした"),
@@ -106,7 +113,7 @@ pub async fn handler(req: Request) -> Result<Response<String>, Error> {
         Ok(r) => r,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "リクエストボディが不正です"),
     };
-    dispatch(exec_req).await
+    dispatch(exec_req, header_token.as_deref()).await
 }
 
 /// 検証して実行する。HTTP の殻を剥がした本体。
@@ -114,11 +121,14 @@ pub async fn handler(req: Request) -> Result<Response<String>, Error> {
 /// `handler` から切り出してあるのは、`Request` の中身 (`hyper::body::Incoming`) が
 /// テストから組み立てられないため。ここを独立させておくと、実際に配信されるコードを
 /// そのまま実上流に対して走らせて検証できる (下の `#[ignore]` テストと tools/local_server.rs)。
-pub async fn dispatch(exec_req: ExecuteRequest) -> Result<Response<String>, Error> {
+pub async fn dispatch(
+    exec_req: ExecuteRequest,
+    header_token: Option<&str>,
+) -> Result<Response<String>, Error> {
     if let Err(msg) = validate(&exec_req) {
         return json_error(StatusCode::BAD_REQUEST, &msg);
     }
-    match run_in_sandbox(exec_req.language, &exec_req.code).await {
+    match run_in_sandbox(exec_req.language, &exec_req.code, header_token).await {
         Ok(resp) => ok(&resp),
         Err(e) => e.into_response(),
     }
@@ -130,18 +140,14 @@ fn image() -> String {
 
 /// 上流の認証トークン。
 ///
-/// 本番では OIDC トークンが自動で環境に入る。入らない環境 (ローカル検証・
-/// OIDC を無効にした場合) 向けに個人アクセストークンのフォールバックを残すが、
+/// **本番はリクエストヘッダ `x-vercel-oidc-token` から来る** (Vercel は関数の実行時に
+/// 環境変数ではなくヘッダで渡す)。ローカル検証は `vercel env pull` が置く
+/// `VERCEL_OIDC_TOKEN`。最後のフォールバックは個人アクセストークンだが、
 /// **リポジトリとローカル環境にトークンは置かない** (Vercel 側の環境変数に入れる)。
-fn token() -> Option<String> {
-    for key in ["VERCEL_OIDC_TOKEN", "KNOCKS_VERCEL_TOKEN"] {
-        if let Ok(v) = std::env::var(key) {
-            if !v.trim().is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    None
+fn token(header_token: Option<&str>) -> Option<String> {
+    let oidc = std::env::var("VERCEL_OIDC_TOKEN").ok();
+    let fallback = std::env::var("KNOCKS_VERCEL_TOKEN").ok();
+    pick_token(header_token, oidc.as_deref(), fallback.as_deref())
 }
 
 /// 推測できない 16 進文字列。セクション区切りの nonce と cmdId に使う。
@@ -171,8 +177,9 @@ fn client() -> Result<reqwest::Client, SandboxError> {
 async fn run_in_sandbox(
     language: Language,
     code: &str,
+    header_token: Option<&str>,
 ) -> Result<ExecuteResponse, SandboxError> {
-    let token = token().ok_or(SandboxError::NoCredentials)?;
+    let token = token(header_token).ok_or(SandboxError::NoCredentials)?;
     let client = client()?;
 
     let nonce = Nonce::new(&random_hex());
@@ -307,7 +314,7 @@ mod upstream_tests {
 
     async fn run(lang: Language, user_code: &str) -> (StatusCode, ExecuteResponse) {
         let code = compose_submission(lang, user_code, fixtures::for_language(lang).hidden_tests);
-        let resp = dispatch(ExecuteRequest::judge(lang, &code)).await.expect("dispatch が失敗");
+        let resp = dispatch(ExecuteRequest::judge(lang, &code), None).await.expect("dispatch が失敗");
         let status = resp.status();
         let body = resp.into_body();
         if status != StatusCode::OK {

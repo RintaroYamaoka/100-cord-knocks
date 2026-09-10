@@ -5,8 +5,8 @@
 //! 変わっても緑のままになる。
 
 use shared::sandbox::{
-    classify_sandbox_failure, parse_command_stream, CreateSandboxRequest, CreateSandboxResponse,
-    UpstreamFailure,
+    classify_sandbox_failure, parse_command_stream, pick_token, CreateSandboxRequest,
+    CreateSandboxResponse, UpstreamFailure, OIDC_HEADER,
 };
 
 /// 実測した作成応答 (一部のフィールドのみ残した)。
@@ -107,4 +107,39 @@ fn image_not_ready_is_transient() {
         classify_sandbox_failure(400, "{\"error\":{\"code\":\"image_not_ready\"}}"),
         UpstreamFailure::Transient
     );
+}
+
+// ---- 認証トークンの取り方 (2026-09-11 の本番障害) ----
+
+#[test]
+fn the_request_header_is_the_production_source_of_the_token() {
+    // Vercel は**関数には環境変数ではなくリクエストヘッダで** OIDC トークンを渡す
+    // (docs/oidc の "In Vercel Functions")。env だけを見ていたため、初回の本番
+    // デプロイが全言語 500「認証情報がありません」になった
+    assert_eq!(OIDC_HEADER, "x-vercel-oidc-token");
+    assert_eq!(pick_token(Some("from-header"), None, None).as_deref(), Some("from-header"));
+}
+
+#[test]
+fn header_wins_over_environment() {
+    // 本番ではヘッダのトークンが毎回更新される。env に古いものが残っていても従わない
+    assert_eq!(
+        pick_token(Some("fresh"), Some("stale"), Some("pat")).as_deref(),
+        Some("fresh")
+    );
+}
+
+#[test]
+fn environment_is_the_local_development_fallback() {
+    // ローカルは `vercel env pull` が VERCEL_OIDC_TOKEN を置く
+    assert_eq!(pick_token(None, Some("local-oidc"), None).as_deref(), Some("local-oidc"));
+    // OIDC が使えない環境向けの個人アクセストークン
+    assert_eq!(pick_token(None, None, Some("pat")).as_deref(), Some("pat"));
+}
+
+#[test]
+fn blank_values_are_not_tokens() {
+    // 空文字のヘッダ / 環境変数を「ある」と扱うと、401 を認証情報の不備として表示できない
+    assert_eq!(pick_token(Some("  "), Some(""), None), None);
+    assert_eq!(pick_token(None, None, None), None);
 }

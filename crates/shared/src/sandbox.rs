@@ -158,6 +158,33 @@ pub fn parse_command_stream(ndjson: &str) -> CommandResult {
     result
 }
 
+/// Vercel が関数実行時に OIDC トークンを載せてくるリクエストヘッダ。
+///
+/// **環境変数ではない。** ビルド時とローカル (`vercel env pull`) は
+/// `VERCEL_OIDC_TOKEN` だが、関数の実行時はリクエストヘッダで渡される
+/// (https://vercel.com/docs/oidc の "In Vercel Functions")。
+/// ここを env だけ見ていたため、2026-09-11 の初回デプロイが全言語
+/// 500「認証情報がありません」になった。
+pub const OIDC_HEADER: &str = "x-vercel-oidc-token";
+
+/// 使うトークンを決める。優先順は リクエストヘッダ → `VERCEL_OIDC_TOKEN` → フォールバック。
+///
+/// ヘッダを最優先にするのは、本番ではこれだけが毎回更新される有効なトークンだから。
+/// 空白だけの値は「無い」として扱う (無効なトークンで 401 を踏むより、
+/// 認証情報が無いと分かる方が切り分けが速い)。
+pub fn pick_token(
+    header: Option<&str>,
+    env_oidc: Option<&str>,
+    env_fallback: Option<&str>,
+) -> Option<String> {
+    [header, env_oidc, env_fallback]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
 /// 上流が失敗したときの種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamFailure {

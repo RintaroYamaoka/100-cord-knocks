@@ -73,6 +73,12 @@ async fn handle(
                 r#"{"error":"POST のみ受け付けます"}"#.into(),
             ));
         }
+        // 本番ハンドラと同じ順序: body を消費する前にトークンのヘッダを取る
+        let header_token = req
+            .headers()
+            .get(shared::sandbox::OIDC_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let bytes = match req.into_body().collect().await {
             Ok(c) => c.to_bytes(),
             Err(_) => {
@@ -89,7 +95,7 @@ async fn handle(
             }
         };
         // ここが要点: 本番と同じ dispatch を呼ぶ (プロキシを書き直さない)
-        return Ok(match execute::dispatch(exec_req).await {
+        return Ok(match execute::dispatch(exec_req, header_token.as_deref()).await {
             Ok(resp) => {
                 let status = resp.status();
                 json(status, resp.into_body())
